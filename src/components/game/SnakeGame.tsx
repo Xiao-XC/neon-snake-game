@@ -1,83 +1,132 @@
 /**
- * Neon Snake — minimalism-styled arcade snake game.
- * Single React component rendering to an HTML5 <canvas> with a rAF loop,
- * keyboard + touch controls, WebAudio sound, localStorage persistence.
- * No external assets; all visuals are generated shapes/CSS.
+ * Neon Snake — a minimalist arcade snake game.
+ *
+ * Rendering: HTML5 <canvas>, fixed 21×21 logical grid, DPR-aware backing
+ * store, requestAnimationFrame loop with a fixed-timestep simulation.
+ * Input:   keyboard (arrows/WASD/Space/R/M/Enter) + touch swipe + on-screen
+ *          d-pad on small screens.
+ * Audio:   procedural WebAudio blips (no asset files), with mute toggle.
+ * Storage: high score / mute / reduced-fx persisted in localStorage.
+ * Visuals: near-monochrome palette, generated shapes only — no assets.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { AnimatePresence, motion } from "framer-motion";
 import {
-  ArrowUp,
   ArrowDown,
   ArrowLeft,
   ArrowRight,
+  ArrowUp,
+  Info,
   Pause,
   Play,
   RotateCcw,
   Volume2,
   VolumeX,
-  Info,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
-/*  Constants & helpers                                                */
+/*  Constants                                                          */
 /* ------------------------------------------------------------------ */
 
-const GRID = 21; // 21×21 cells — odd so the centre spawn is symmetric
-const CANVAS = 462; // 462px logical canvas (21 × 22px cells)
-const CELL = CANVAS / GRID;
+const GRID = 21; // grid is 21×21 cells (odd → symmetric centre spawn)
+const CANVAS = 462; // logical canvas size in px (GRID × 22px cells)
+const CELL = CANVAS / GRID; // logical size of one cell
 
-// Minimalism palette (matches index.css tokens, near-monochrome)
-const COLORS = {
+const START_LIVES = 3;
+const MAX_LEVEL = 6;
+const FOODS_PER_LEVEL = 8;
+const POINTS_FOOD = 10;
+const POINTS_BONUS = 40;
+const LEVELS_SPEED_MS = [170, 145, 122, 102, 86, 72]; // ms per step per level
+const POWERUP_INTERVAL = 9000; // ms between power-up spawns
+const POWERUP_LIFETIME = 7000; // ms a power-up stays on the board
+const GHOST_MS = 5000; // ghost (wrap-through) duration
+const SLOW_MS = 6000; // slow-motion duration
+const RESPAWN_MS = 900; // death pause before respawn / game over
+
+/** Near-monochrome palette aligned with the minimalism theme tokens. */
+const C = {
   bg: "#0b0b0c",
-  grid: "rgba(255,255,255,0.035)",
-  border: "rgba(255,255,255,0.09)",
+  dot: "rgba(255,255,255,0.05)",
+  border: "rgba(255,255,255,0.14)",
   snake: "#ffffff",
-  snakeDim: "rgba(255,255,255,0.72)",
-  snakeTail: "opacity" as const,
   food: "#e4e4e7",
-  bonus: "#d4d4d8",
-  slow: "#a1a1aa",
-  ghost: "#71717a",
-  ghostTrail: "rgba(255,255,255,0.12)",
+  ink: "#0b0b0c",
+  particle: "#ffffff",
+  ghostTrail: "rgba(255,255,255,0.10)",
 };
 
 const LS = {
-  high: "neon-snake.high",
-  muted: "neon-snake.muted",
-  see: "neon-snake.see",
-  a11y: "neon-snake.a11y",
+  high: "neon-snake:high",
+  muted: "neon-snake:muted",
+  fx: "neon-snake:reduced-fx",
 };
 
-function safeGet(key: string): string | null {
+type Pt = { x: number; y: number };
+type Dir = "up" | "down" | "left" | "right";
+type Phase = "start" | "playing" | "paused" | "dying" | "over" | "won";
+type PowerType = "bonus" | "slow" | "ghost" | "shrink";
+type PowerUp = { cell: Pt; type: PowerType; born: number };
+type Particle = { x: number; y: number; vx: number; vy: number; life: number; max: number };
+
+const DIR_V: Record<Dir, Pt> = {
+  up: { x: 0, y: -1 },
+  down: { x: 0, y: 1 },
+  left: { x: -1, y: 0 },
+  right: { x: 1, y: 0 },
+};
+const OPPOSITE: Record<Dir, Dir> = { up: "down", down: "up", left: "right", right: "left" };
+const POWER_LETTER: Record<PowerType, string> = { bonus: "+", slow: "S", ghost: "G", shrink: "−" };
+
+/* ------------------------------------------------------------------ */
+/*  Tiny helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+function lsGet(key: string): string | null {
   try {
     return localStorage.getItem(key);
   } catch {
     return null;
-try {
+  }
 }
-}
-function safeSet(key: string, value: string) {
+function lsSet(key: string, value: string) {
   try {
-    tiny-router-stack} catch {
-    // ignore
+    localStorage.setItem(key, value);
+  } catch {
+    /* storage unavailable (private mode) — non-fatal */
   }
 }
 function randCell(): number {
   return Math.floor(Math.random() * GRID);
 }
 
-type Pt = { x: number; y: number };
-const eq = (a: Pt, b: Pt) => a.x === b.x && a.y === b.y;
+/** Rounded-rect path (used for snake segments). */
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
 
 /* ------------------------------------------------------------------ */
-/*  Audio — procedural WebAudio beeps, no files needed                 */
+/*  Procedural sound effects (WebAudio, no files)                      */
 /* ------------------------------------------------------------------ */
 
 class Sfx {
-  private ctx: AudioContext | null = null;
   muted = false;
+  private ctx: AudioContext | null = null;
 
   private ensure(): AudioContext | null {
     if (this.muted) return null;
@@ -85,9 +134,8 @@ class Sfx {
       if (!this.ctx) {
         const AC =
           window.AudioContext ??
-          (window as unknown as { webkitAudioContext?: typeof AudioContext })
-            .webkitAudioContext;
-        lazily-lit-any
+          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (!AC) return null;
         this.ctx = new AC();
       }
       if (this.ctx.state === "suspended") void this.ctx.resume();
@@ -97,94 +145,72 @@ class Sfx {
     }
   }
 
-  private beep(freq: number, dur: number, type: OscillatorType, vol = 0.12) {
+  private beep(freq: number, dur: number, type: OscillatorType, vol = 0.1, delay = 0) {
     const ctx = this.ensure();
     if (!ctx) return;
+    const t0 = ctx.currentTime + delay;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.type = type;
     osc.frequency.value = freq;
-    gain.gain.setValueAtTime(vol, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
-    osc.connect(gain).connect(ctx.destination);
-    osc.start();
-    osc.stop(ctx.currentTime + dur);
+    gain.gain.setValueAtTime(vol, t0);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur);
   }
 
   eat() {
-    this.beep(660, 0.09, "square", 0.1);
-    this.beep(880, 0.1, "square", 0.08);
+    this.beep(620, 0.07, "square", 0.08);
+    this.beep(930, 0.09, "square", 0.07, 0.05);
   }
-  bonus() {
-    this.beep(523, 0.08, "triangle", 0.12);
-    this.beep(659, 0.08, "triangle", 0.12);
-    this.beep(784, 0.14, "triangle", 0.12);
+  power() {
+    this.beep(523, 0.08, "triangle", 0.1);
+    this.beep(659, 0.08, "triangle", 0.1, 0.07);
+    this.beep(784, 0.12, "triangle", 0.1, 0.14);
   }
-  ghost() {
-    this.beep(200, 0.25, "sawtooth", 0.1);
+  levelUp() {
+    this.beep(440, 0.1, "square", 0.08);
+    this.beep(660, 0.1, "square", 0.08, 0.09);
+    this.beep(880, 0.16, "square", 0.08, 0.18);
   }
   die() {
-    this.beep(220, 0.18, "square", 0.14);
-    this.beep(180, 0.18, "square", 0.14);
-    this.beep(110, 0.3, "square", 0.14);
+    this.beep(220, 0.16, "square", 0.12);
+    this.beep(160, 0.18, "square", 0.12, 0.14);
+    this.beep(110, 0.3, "square", 0.12, 0.3);
   }
   win() {
-    const notes = [523, 659, 784, 1047];
-    notes.forEach((f, i) => {
-      setTimeout(() => this.beep(f, 0.15, "triangle", 0.12), i * 120);
-      setTimeout(() => this.beep(f, 0.15, "triangle", 0.12), i * 120);
-    });
-  }
-  click() {
-    this.beep(440, 0.05, "square", 0.06);
+    [523, 659, 784, 1047].forEach((f, i) => this.beep(f, 0.16, "triangle", 0.11, i * 0.13));
   }
 }
 
 /* ------------------------------------------------------------------ */
-/*  Small building blocks                                              */
+/*  Small presentational pieces                                        */
 /* ------------------------------------------------------------------ */
 
-function Pill({
-  icon,
-  label,
-  value,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: React.ReactNode;
-}) {
+/** Micro stat pill used in the HUD row. */
+function Pill({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-2 rounded-lg border border-border bg-card/60 px-3 py-1.5">
-      {icon}
-      <span className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-        {label}
-      </span>
+    <div className="flex items-baseline gap-2 border border-border bg-card/50 px-3 py-1.5">
+      <span className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground">{label}</span>
       <span className="font-mono text-sm tabular-nums">{value}</span>
     </div>
   );
-
-function GhostBadge({ seconds }: { seconds: number }) {
-  return (
-    <div
-      className="rounded-lg border border-border bg-card/60 px-3 py-1.5 text-[11px] uppercase tracking-[0.18em] text-muted-foreground"
-      aria-live="polite"
-    >
-      Ghost <span className="font-mono tabular-nums text-foreground">{seconds}s</span>
-    </div>
-  );
 }
 
-function Kbd({ children }: { children: React.ReactNode }) <div className="min-h-screen">;
+/** Tiny keycap for the desktop control legend. */
+function Kbd({ children }: { children: React.ReactNode }) {
   return (
-    <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-border bg-card/60 px-1.5 font-mono text-[11px] text-muted-foreground">
+    <kbd className="inline-flex h-6 min-w-6 items-center justify-center border border-border bg-card/50 px-1.5 font-mono text-[10px] text-muted-foreground">
       {children}
     </kbd>
   );
 }
 
-/** Minimal SVG board icon (21×21 cells as tiny rects) — used on landing. */
-function BoardIcon({ className = "h-7 w-7" }: { className?: string }) {
-  const cells = [
+/** Minimal generated board mark — 21×21 pixel grid as tiny rects. */
+function BoardMark({ className = "h-6 w-6" }: { className?: string }) {
+  const cells: Array<[number, number]> = [
     [10, 3], [10, 4], [10, 5], [10, 6], [10, 7],
     [11, 7], [12, 7], [13, 7],
     [4, 14], [5, 14], [6, 14], [7, 14], [8, 14], [9, 14], [10, 14],
@@ -195,719 +221,930 @@ function BoardIcon({ className = "h-7 w-7" }: { className?: string }) {
       {cells.map(([x, y], i) => (
         <rect key={i} x={x} y={y} width={1} height={1} fill="currentColor" />
       ))}
-      <circle cx="16.5" cy="15.5" r="0.6" fill="currentColor" opacity="0.5" />
+      <circle cx="16.5" cy="15.5" r="0.6" fill="currentColor" opacity="0.45" />
     </svg>
   );
 }
 
+/** Shared overlay shell for start / pause / over / win / help screens. */
+function Overlay({
+  children,
+  label,
+}: {
+  children: React.ReactNode;
+  label: string;
+}) {
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.18 }}
+      className="absolute inset-0 z-10 flex items-center justify-center bg-background/90 backdrop-blur-[2px]"
+      role="dialog"
+      aria-label={label}
+    >
+      <div className="w-full max-w-xs px-6 text-center">{children}</div>
+    </motion.div>
+  );
+}
+
+/** Big minimal CTA button used on overlays. */
+function OverlayButton({
+  children,
+  onClick,
+  variant = "solid",
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  variant?: "solid" | "ghost";
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={
+        variant === "solid"
+          ? "w-full bg-foreground px-4 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] text-background transition-opacity hover:opacity-80"
+          : "w-full border border-border px-4 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] transition-colors hover:bg-accent"
+      }
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Square icon button for the header controls. */
+function IconButton({
+  label,
+  onClick,
+  disabled,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+      disabled={disabled}
+      className="flex h-9 w-9 items-center justify-center border border-border text-foreground/80 transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+    >
+      {children}
+    </button>
+  );
+}
+
 /* ------------------------------------------------------------------ */
-/*  Main game component                                                */
+/*  Main component                                                     */
 /* ------------------------------------------------------------------ */
-
-type Phase = "start" | "playing" | "paused" | "dying" | "over" | "won";
-type Dir = "up" | "down" | "left" | "right";
-type PowerType = "bonus" | "slow" | "ghost" | "shrink";
-type PowerUp = { id: number; cell: Pt; type: PowerType; born: number };
-
-const DIR_VECTORS: Record<Dir, Pt> = {
-  up: { x: 0, y: -1 },
-  down: { x: 0, y: 1 },
-  left: { x: -1, y: 0 },
-  right: { x: 1, y: 0 },
-};
-const OPPOSITE: Record<Dir, Dir> = {
-  up: "down",
-  down: "up",
-  left: "right",
-  right: "left",
-};
-
-const SPEEDS = [170, 140, 120, 100, 85, 72]; // ms per step per level
-const FOODS_PER_LEVEL = 8;
-const BONUS_POINTS = 50;
-const POINTS = { food: 10, bonus: 40 };
-
-const FULL_LEVEL = 99_999; // seconds of "whole game"
-const GHOST_MS = 5000;
-const SLOW_MS = 6000;
-const POWERUP_LIFETIME = 7000;
 
 export default function SnakeGame() {
-  /* -------- refs: mutable game state (never re-render) -------- */
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const wrapRef = useRef<HTMLDivElement>(null);
+  /* ---------- mutable game state (refs — never trigger re-render) ---------- */
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const boardWrapRef = useRef<HTMLDivElement | null>(null);
   const snake = useRef<Pt[]>([]);
   const dir = useRef<Dir>("right");
-  const queuedDirs = useRef<Dir[]>([]);
+  const queued = useRef<Dir[]>([]);
   const food = useRef<Pt>({ x: 0, y: 0 });
-  const power = useRef<PowerUp | null>(power);
-  const powerTimers = useRef({
-    ghostUntil: 0,
-    slowUntil: 0,
-    shrinkArmed: false,
-    nextSpawn: 0,
-    nextNextSpawn: 0,
-  });
-  const particles = useRef<
-    { x: number; y: number; vx: number; vy: number; life: number; maxLife: number }[]
-  >([]);
-  const shaker = useRef({ t: 0, x: 0, y: 0 });
+  const power = useRef<PowerUp | null>(null);
+  const timers = useRef({ ghostUntil: 0, slowUntil: 0, nextPowerAt: 0 });
+  const particles = useRef<Particle[]>([]);
+  const shake = useRef(0);
   const stepAcc = useRef(0);
-  const lastTime = useRef(0);
-  const rafId = useRef(0);
+  const lastT = useRef(0);
+  const raf = useRef(0);
   const scoreRef = useRef(0);
-  const livesRef = useRef(3);
+  const livesRef = useRef(START_LIVES);
   const levelRef = useRef(1);
-  const foodsThisLevel = useRef(0);
+  const eatenRef = useRef(0);
   const phaseRef = useRef<Phase>("start");
-  const sfx = useRef(new Sfx());
-  const boardElRef = useRef<HTMLDivElement>(null);
+  const fxRef = useRef(false); // true → reduced motion
+  const swipe = useRef<{ x: number; y: number } | null>(null);
+  const sfx = useRef<Sfx | null>(null);
 
-  /* -------- react state: only what the UI displays -------- */
+  /* ---------- reactive state (only what the HUD/overlays show) ---------- */
   const [phase, setPhaseState] = useState<Phase>("start");
   const [score, setScore] = useState(0);
-  const [lives, setLives] = useState(3);
+  const [lives, setLives] = useState(START_LIVES);
   const [level, setLevel] = useState(1);
-  const [high, setHigh] = useState(() => Number(safeGet(LS.high) ?? 0));
-  const [muted, setMuted] = useState(() => safeGet(LS.muted) === "1");
+  const [high, setHigh] = useState(() => Number(lsGet(LS.high) ?? 0));
+  const [muted, setMuted] = useState(() => lsGet(LS.muted) === "1");
+  const [reducedFx, setReducedFx] = useState(() => lsGet(LS.fx) === "1");
   const [ghostSecs, setGhostSecs] = useState(0);
-  const [activePower, setActivePower] = useState<PowerType | null>(null);
+  const [slowSecs, setSlowSecs] = useState(0);
   const [showHelp, setShowHelp] = useState(false);
-  const [showA11y, setShowA11y] = useState(false);
-  const [a11y, setA11y] = useState({
-    reducedFx: safeGet(LS.a11y) === "1",
-    leftyMode: safeGet(LS.panel) === "1",
-  });
-  const [cell, setCell] = useState(CELL);
-  const [flash, setFlash] = useState(0); // damage flash intensity 0..1
-  const [deaths, setDeaths] = useState(0);
-  const [deathsThisLevel, setDeathsThisLevel] = useState(0);
-  const [winSecs, setWinSecs] = useState(0);
 
   const setPhase = useCallback((p: Phase) => {
     phaseRef.current = p;
     setPhaseState(p);
   }, []);
 
-  const pushFlash = useCallback(() => {
-    setFlash(1);
-    window.setTimeout(() => setFlash(0), 180);
-    window.setTimeout(() => setFlash(0), 190);
-  }, []);
-
-  /* -------- persistent helpers -------- */
-  const setMutedPersist = useCallback((v: boolean) => {
-    setMuted(v);
-    sfx.current.muted = v;
-    safeSet(LS.muted, v ? "1" : "0");
-  }, []);
-
-  const bumpHigh = useCallback((s: number) => {
-    setHigh((h) => {
-      if (s > h) {
-        safeSet(LS.high, String(s));
-        return s;
-      }
-      return h;
-    saveHigh);
-  }, []);
-
-  /* -------- audio refs -------- */
+  /* lazily construct Sfx on first client render */
   useEffect(() => {
+    sfx.current = new Sfx();
     sfx.current.muted = muted;
-  }, [muted]);
-
-  /* -------- level & spawning -------- */
-  const spawnFood = useCallback(() => {
-    const occupied = new Set(
-      snake.current.map((s) => `${s.x},${s.y}`).concat(
-        power.current ? [`${power.current.cell.x},${power.current.cell.y}`] : [],
-      ),
-    );
-    let x = 0, y = 0;
-    do {
-      x = randCell();
-      y = randCell();
-    } while (occupied.has(`${x},${y}`));
-    food.current = { x, y };
-  }, []);
-
-  const spawnPower = useCallback(() => {
-    const occupied = new Set(
-      snake.current.map((s) => `${s.x},${s.y}`).concat(
-        [food.current].map((f) => `${f.x},${f.y}`),
-      ),
-    );
-    let x = 0, y = 0;
-    const types: PowerType[] = ["bonus", "slow", "ghost", "shrink"];
-    const type = types[Math.floor(Math.random() * types.length)];
-    do {
-      x = randCell();
-      y = randCell;
-      y = randCell;
-    } while (occupied.has(`${x},${y}`));
-    power.current = { id: Date.now(), cell: { x, y }, type, born: performance.now() };
-  }, []);
-
-  const applyPower = useCallback((type: PowerType) => {
-    switch (type) {
-      case "bonus": {
-        const pts = POINTS.bonus;
-        scoreRef.current += pts;
-        setScore(scoreRef.current);
-        break;
-      +POINTS.bonus);
-      case "slow": {
-        timers.current.slowUntil = performance.now() + SLOW_MS;
-        setActivePower("slow");
-        break;
-      }
-      case "ghost":
-        timers.current.ghostUntil = performance.now() + GHOST_MS;
-        setActivePower("ghost");
-        break;
-      case "shrink": {
-        const keep = Math.max(3, Math.floor(snake.current.length / 2));
-        snake.current = snake.current.slice(0, keep);
-        break;
-      }
-    }
-    sfx.current.bonus();
-  }, []);
-
-  /* -------- reset / lifecycle -------- */
-  const resetGame = useCallback(() => {
+    fxRef.current = reducedFx;
+    // Seed a static board so the pre-game render has something to draw.
     const cx = Math.floor(GRID / 2);
     snake.current = [
       { x: cx - 1, y: cx },
       { x: cx - 2, y: cx },
       { x: cx - 3, y: cx },
-    */
-    dir.current = "right";
-    queuedDirs.current = [];
-    scoreRef.current = 0;
-    setScore(0);
-    livesRef.current = 3;
-    setLives(3);
-    levelRef.current = 1;
-    setLevel(1);
-    foodsThisLevel.current = 0;
-    setDeaths(0);
-    setDeathsThisLevel(0);
-    timers.current = {
-      ghostUntil: 0,
-      slowUntil: 0,
-      shrinkArmed: false,
-      nextSpawn: 0,
-      nextNextSpawn: 0;
-    };
-    particles.current = [];
-    power.current = null;
+    ];
     spawnFood();
-    setCell(CELL);
-    setFlash(0);
-    setGhostSecs(0);
-    setActivePower(null);
-    pushFlash();
-  }, [spawnFood, pushFlash]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  /* -------- death & life handling -------- */
-  const startDying = useCallback(() => {
-    setPhase("dying");
-    deaths.current += 1;
-    setDeaths((d) => d + 1);
-    sfx.current.die();
-    particles.current = [];
-    const head = snake.current[0];
-    for (let i = 0; i < 18; i++) {
+  useEffect(() => {
+    if (sfx.current) sfx.current.muted = muted;
+  }, [muted]);
+  useEffect(() => {
+    fxRef.current = reducedFx;
+  }, [reducedFx]);
+
+  const toggleMuted = useCallback(() => {
+    setMuted((m) => {
+      const v = !m;
+      lsSet(LS.muted, v ? "1" : "0");
+      return v;
+    });
+  }, []);
+
+  const toggleReducedFx = useCallback(() => {
+    setReducedFx((r) => {
+      const v = !r;
+      lsSet(LS.fx, v ? "1" : "0");
+      return v;
+    });
+  }, []);
+
+  /** Add points; keep the high score live-updated and persisted. */
+  const addScore = useCallback((n: number) => {
+    scoreRef.current += n;
+    setScore(scoreRef.current);
+    setHigh((h) => {
+      if (scoreRef.current > h) {
+        lsSet(LS.high, String(scoreRef.current));
+        return scoreRef.current;
+      }
+      return h;
+    });
+  }, []);
+
+  /* ---------- spawning ---------- */
+
+  const spawnFood = useCallback(() => {
+    const taken = new Set(snake.current.map((p) => `${p.x},${p.y}`));
+    if (power.current) taken.add(`${power.current.cell.x},${power.current.cell.y}`);
+    let x = 0;
+    let y = 0;
+    do {
+      x = randCell();
+      y = randCell();
+    } while (taken.has(`${x},${y}`));
+    food.current = { x, y };
+  }, []);
+
+  const spawnPower = useCallback(() => {
+    const taken = new Set(snake.current.map((p) => `${p.x},${p.y}`));
+    taken.add(`${food.current.x},${food.current.y}`);
+    let x = 0;
+    let y = 0;
+    do {
+      x = randCell();
+      y = randCell();
+    } while (taken.has(`${x},${y}`));
+    const types: PowerType[] = ["bonus", "slow", "ghost", "shrink"];
+    const type = types[Math.floor(Math.random() * types.length)];
+    power.current = { cell: { x, y }, type, born: performance.now() };
+  }, []);
+
+  /** Particle burst at a logical board position. */
+  const burst = useCallback((x: number, y: number, count: number) => {
+    if (fxRef.current) return;
+    for (let i = 0; i < count; i++) {
       const a = Math.random() * Math.PI * 2;
+      const sp = 40 + Math.random() * 110;
       particles.current.push({
-        x: (head.x + 0.5) * cell,
-        y: (head.y + 0.5) * cell,
-        vx: Math.cos(a) * (40 + Math.random() * 90),
-        death: 0,
-        vy: Math.sin(a) * (40 + Math.random() * 90),
-        life: 0.5 + Math.random() * 0.4,
-        maxLife: 0.9,
+        x,
+        y,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp,
+        life: 0.4 + Math.random() * 0.4,
+        max: 0.8,
       });
     }
+  }, []);
+
+  /* ---------- power-up pickup ---------- */
+
+  const applyPower = useCallback(
+    (type: PowerType) => {
+      const now = performance.now();
+      switch (type) {
+        case "bonus":
+          addScore(POINTS_BONUS);
+          break;
+        case "slow":
+          timers.current.slowUntil = now + SLOW_MS;
+          setSlowSecs(Math.ceil(SLOW_MS / 1000));
+          break;
+        case "ghost":
+          timers.current.ghostUntil = now + GHOST_MS;
+          setGhostSecs(Math.ceil(GHOST_MS / 1000));
+          break;
+        case "shrink": {
+          const keep = Math.max(3, Math.floor(snake.current.length / 2));
+          snake.current = snake.current.slice(0, keep);
+          break;
+        }
+      }
+      sfx.current?.power();
+    },
+    [addScore],
+  );
+
+  /* ---------- lifecycle: reset / death / win ---------- */
+
+  const resetRun = useCallback(() => {
+    const cx = Math.floor(GRID / 2);
+    snake.current = [
+      { x: cx - 1, y: cx },
+      { x: cx - 2, y: cx },
+      { x: cx - 3, y: cx },
+    ];
+    dir.current = "right";
+    queued.current = [];
+    scoreRef.current = 0;
+    setScore(0);
+    livesRef.current = START_LIVES;
+    setLives(START_LIVES);
+    levelRef.current = 1;
+    setLevel(1);
+    eatenRef.current = 0;
+    timers.current = { ghostUntil: 0, slowUntil: 0, nextPowerAt: performance.now() + POWERUP_INTERVAL };
+    power.current = null;
+    particles.current = [];
+    shake.current = 0;
+    stepAcc.current = 0;
+    setGhostSecs(0);
+    setSlowSecs(0);
+    spawnFood();
+  }, [spawnFood]);
+
+  const beginGame = useCallback(() => {
+    resetRun();
+    setPhase("playing");
+  }, [resetRun, setPhase]);
+
+  const respawn = useCallback(() => {
+    const cx = Math.floor(GRID / 2);
+    snake.current = [
+      { x: cx - 1, y: cx },
+      { x: cx - 2, y: cx },
+      { x: cx - 3, y: cx },
+    ];
+    dir.current = "right";
+    queued.current = [];
+    power.current = null;
+    timers.current.ghostUntil = 0;
+    timers.current.slowUntil = 0;
+    setGhostSecs(0);
+    setSlowSecs(0);
+    stepAcc.current = 0;
+    spawnFood();
+    setPhase("playing");
+  }, [spawnFood, setPhase]);
+
+  /** Death sequence: burst, shake, pause, then respawn or game over. */
+  const die = useCallback(() => {
+    setPhase("dying");
+    sfx.current?.die();
+    const head = snake.current[0];
+    burst((head.x + 0.5) * CELL, (head.y + 0.5) * CELL, 20);
+    if (!fxRef.current) shake.current = 10;
     window.setTimeout(() => {
-      if (phaseRef.current !== "dying") return;
-      const remaining = 3 - (deaths + 1);
-      if (remaining <= 0) {
-        bumpHigh(scoreRef.current);
+      if (phaseRef.current !== "dying") return; // user restarted meanwhile
+      livesRef.current -= 1;
+      setLives(livesRef.current);
+      if (livesRef.current <= 0) {
         setPhase("over");
       } else {
-        // respawn: keep score/level, reset snake, clear powers
-        const cx = Math.floor(GRID / 2);
-        snake.current = [
-          { x: cx - 1, y: cx },
-          { x: cx - 2, y: cx },
-          { x: cx - 3, y: cx },
-        ];
-        dir.current = "right";
-        queuedDirs.current = [];
-        power.current = null;
-        timers.current.ghostUntil = 0;
-        timers.current.slowUntil = 0;
-        setGhostSecs(0);
-        setActivePower(null);
-        spawnFood();
-        setPhase("playing");
+        respawn();
       }
-      setDeathsThisLevel(0);
-    }, 900);
-  }, [cell, bumpHigh, spawnFood, setPhase, deaths]);
+    }, RESPAWN_MS);
+  }, [burst, respawn, setPhase]);
 
-  const won = useCallback(() => {
-    bumpHigh(scoreRef.current);
-    sfx.current.win();
-    setWinSecs(30);
+  const winGame = useCallback(() => {
     setPhase("won");
-  }, [bumpHigh, setPhase]);
+    sfx.current?.win();
+  }, [setPhase]);
 
-  /* -------- step logic (called on fixed timestep) -------- */
+  /* ---------- one simulation step (fixed timestep) ---------- */
+
   const step = useCallback(() => {
     const s = snake.current;
 
-    // consume queued direction changes (max 2 buffered)
-    const nd = queuedDirs.current.shift();
-    if (nd && nd !== OPPOSITE[dir.current]) dir.current = nd;
-
-    // compute next head
-    const v = DIR_VECTORS[dir.current];
-    let hx = s[0].x + v.x;
-    let hy = s[0].y + v.y;
-
-    // wall & self collisions
-    const out = hx < 0 || hy < 0 || hx >= GRID || hy >= GRID;
-    const bodyHit = s.some((p, i) => i > 0 && p.x === hx && p.y === hy);
-    const ghost = performance.now() < timers.current.ghostUntil;
-
-    if ((out || bodyHit) && !ghost) {
-      startDying();
-      return;
+    // consume one buffered direction (blocks 180° reversals)
+    while (queued.current.length > 0) {
+      const nd = queued.current.shift()!;
+      if (nd !== dir.current && nd !== OPPOSITE[dir.current]) {
+        dir.current = nd;
+        break;
+      }
     }
 
-    // wrap when ghosted (else already handled above)
+    const v = DIR_V[dir.current];
+    let hx = s[0].x + v.x;
+    let hy = s[0].y + v.y;
+    const ghost = performance.now() < timers.current.ghostUntil;
+    const out = hx < 0 || hy < 0 || hx >= GRID || hy >= GRID;
+
+    if (out && !ghost) {
+      die();
+      return;
+    }
     if (out) {
-      hx = (hx + GRID) % GRID;
+      hx = (hx + GRID) % GRID; // ghost mode wraps through walls
       hy = (hy + GRID) % GRID;
+    }
+
+    // self collision (ignore the tail cell — it moves away this step)
+    // ghost mode also phases through the body, per the power's promise
+    if (!ghost) {
+      for (let i = 0; i < s.length - 1; i++) {
+        if (s[i].x === hx && s[i].y === hy) {
+          die();
+          return;
+        }
+      }
     }
 
     s.unshift({ x: hx, y: hy });
 
-    // eat food
+    // food
     if (hx === food.current.x && hy === food.current.y) {
-      scoreRef.current += POINTS.food;
-      setScore(scoreRef.current);
-      foodsThisLevel.current += 1;
-      sfx.current.eat();
-      burst((hx + 0.5) * cell, (hy + 0.5) * cell, 10);
-      if (foodsThisLevel.current >= FOODS_PER_LEVEL) {
-        foodsThisLevel.current = 0;
-        levelRef.current += 1;
-        setLevel(levelRef.current);
-        sfx.current.bonus();
-        if (levelRef.current > 6) {
-          won();
+      addScore(POINTS_FOOD);
+      eatenRef.current += 1;
+      sfx.current?.eat();
+      burst((hx + 0.5) * CELL, (hy + 0.5) * CELL, 8);
+      if (eatenRef.current >= FOODS_PER_LEVEL) {
+        eatenRef.current = 0;
+        if (levelRef.current >= MAX_LEVEL) {
+          winGame();
           return;
         }
-        pushFlash();
+        levelRef.current += 1;
+        setLevel(levelRef.current);
+        sfx.current?.levelUp();
       }
       spawnFood();
+    } else {
+      s.pop(); // no growth → tail moves
     }
 
-    // eat power-up
-    if (power.current && eq(power.current.cell, { x: hx, y: hy })) {
+    // power-up pickup
+    if (power.current && power.current.cell.x === hx && power.current.cell.y === hy) {
       const type = power.current.type;
       power.current = null;
-      timers.current.nextSpawn = performance.now() + POWERUP_INTERVAL;
+      timers.current.nextPowerAt = performance.now() + POWERUP_INTERVAL;
       applyPower(type);
     }
+  }, [addScore, applyPower, burst, die, spawnFood, winGame]);
 
-    // tail handling: grow on food, shrink otherwise
-    const grow = hx === food.current.x && hy === food.current.y;
-    if (!grow) s.pop();
-    if (grow) s.pop(); // double pop bug?
-  }, [cell, startDying, spawnFood, applyPower, won, pushFlash]);
+  /* ---------- frame render ---------- */
 
-  /* -------- render function -------- */
   const render = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const size = cell;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
+    const t = performance.now();
+    const s = snake.current;
+    if (s.length === 0) return; // nothing seeded yet (first frames)
+    const ghost = t < timers.current.ghostUntil;
 
-    // motion trail (semi-transparent clear)
-    ctx.fillStyle = COLORS.bg;
-    ctx.globalAlpha = 0.35;
-    for (let i = 0; i < 1; i++) ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, CANVAS, CANVAS);
+
+    // subtle screen shake on death
+    ctx.save();
+    if (shake.current > 0 && !fxRef.current) {
+      const d = shake.current / 10;
+      ctx.translate((Math.random() - 0.5) * d * 6, (Math.random() - 0.5) * d * 6);
+    }
+
+    // background + dot grid
+    ctx.fillStyle = C.bg;
+    ctx.fillRect(0, 0, CANVAS, CANVAS);
+    ctx.fillStyle = C.dot;
+    for (let y = 0; y < GRID; y++) {
+      for (let x = 0; x < GRID; x++) {
+        ctx.fillRect(x * CELL + CELL / 2 - 1, y * CELL + CELL / 2 - 1, 2, 2);
+      }
+    }
+
+    // food — pulsing disc
+    const pulse = 0.85 + 0.15 * Math.sin(t / 180);
+    ctx.fillStyle = C.food;
+    ctx.beginPath();
+    ctx.arc((food.current.x + 0.5) * CELL, (food.current.y + 0.5) * CELL, CELL * 0.26 * pulse, 0, Math.PI * 2);
+    ctx.fill();
+
+    // power-up — lettered disc, blinks before expiring
+    if (power.current) {
+      const { cell: c, type, born } = power.current;
+      const age = t - born;
+      const blink = age > POWERUP_LIFETIME - 2000 ? (Math.sin(t / 80) + 1) / 2 : 1;
+      ctx.globalAlpha = 0.55 + 0.45 * blink;
+      ctx.fillStyle = C.snake;
+      ctx.beginPath();
+      ctx.arc((c.x + 0.5) * CELL, (c.y + 0.5) * CELL, CELL * 0.34, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = C.ink;
+      ctx.font = `bold ${Math.floor(CELL * 0.62)}px ui-monospace, SFMono-Regular, monospace`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(POWER_LETTER[type], (c.x + 0.5) * CELL, (c.y + 0.5) * CELL + 1);
+    }
+
+    // snake body — fading rounded segments
+    for (let i = s.length - 1; i >= 1; i--) {
+      const seg = s[i];
+      const fade = 0.28 + 0.44 * (1 - i / Math.max(1, s.length - 1));
+      ctx.globalAlpha = ghost ? fade * 0.6 : fade;
+      ctx.fillStyle = C.snake;
+      roundRect(ctx, seg.x * CELL + 2, seg.y * CELL + 2, CELL - 4, CELL - 4, 4);
+    }
     ctx.globalAlpha = 1;
 
-    // shake
-    if (shaker.current.t > 0) {
-      shaker.current.t -= 1;
-      const decay = shaker.current.t / 10;
-      ctx.translate(
-        (Math.random() - 0. whole-board),
-        (Math.random() - 0.5) * decay * 6,
-      );
+    // ghost-mode wrap hint: soft border glow while active
+    if (ghost) {
+      ctx.strokeStyle = C.ghostTrail;
+      ctx.lineWidth = 4;
+      ctx.strokeRect(2, 2, CANVAS - 4, CANVAS - 4);
     }
 
-    // grid dots (minimalist dot grid)
-    ctx.fillStyle = COLORS.grid;
-    for (y in range(GRID)) {
-      for (let x = 0; x < GRID; x++) {
-        ctx.fillRect(x * size + size / 2 - 1, y * size + size / 2, 2, 2);
-      }
-      (x * size + size / 2 - 1, y * size + size / 2 - 1, 2, 2);
-    }
-
-    // board border
-    ctx.strokeStyle = COLORS.border;
-    ctx.lineWidth = 1;
-    ctx.strokeRect(0.5, 0.5, canvas.width - 1, canvas.opaque - 1);
+    // head — always solid
+    ctx.fillStyle = C.snake;
+    roundRect(ctx, s[0].x * CELL + 1, s[0].y * CELL + 1, CELL - 2, CELL - 2, 5);
 
     // particles
+    ctx.fillStyle = C.particle;
     for (const p of particles.current) {
-      ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(p.x - 1.5, p.y - 1. ghostTrail);
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
       ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
     }
     ctx.globalAlpha = 1;
 
-    // food
-    const pulse = 0.85 + 0.15 * Math.sin(performance.now() / 200);
-    ctx.fillStyle = COLORS.food;
-    ctx.beginPath();
-    ctx.arc(
-      (food.current.x + 0.5) * size,
-      (food.current.y + 0.5) * size,
-      size * 0.28 * pulse,
-      0,
-      Math.PI * 2,
-    );
-    ctx.fill();
+    // hairline board border
+    ctx.strokeStyle = C.border;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(0.5, 0.5, CANVAS - 1, CANVAS - 1);
 
-    // power-up
-    if (power.current) {
-      const { cell: c, type, born } = power.current;
-      const age = performance.now() - born;
-      const bl = age > POWERUP_LIFETIME - 2000 ? (Math.sin(performance.now() / 90) + 1) / 2 : 1;
-      ctx.globalAlpha = 0.5 + 0.5 * bl;
-      ctx.fillStyle = COLORS[type];
-      if (type === "bonus") {
-        ctx.beginPath();
-        ctx.arc((c.x + 0.50, (c.y + 0.5) * size, size * 0.3, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.globalAlpha = 1;
-        ctx.fillStyle = "#0b0b0c";
-        ctx.font = `bold ${Math.floor(size * 0.7)}px ui-monospace, monospace`;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText("$", (c.x + 0.5) * size, (c.y + 0.5) * size + 1);
-      } else {
-        ctx.beginPath();
-        ctx.arc((c.x + 0.5) * size, (c.y + 0.5) * size, size * 0.3, 0, Math feel);
-        ctx.fill();
-        ctx.fillStyle = "#0b0b0c";
-        ctx.font = `bold ${Math.floor(size * 0.6)}px ui-monospace, monospace glyph-letters;
-        ctx.fillText(
-          type === "slow" ? "S" : type === "ghost" ? "G" : "–",
-          (c.x + 0 letters) * size,
-          (c overlay) * size + 1,
-        );
-      }
-      ctx.globalAlpha = 1;
-    }
+    ctx.restore();
+  }, []);
 
-    // ghost mode trail
-    if (ghost) {
-      ctx.fillStyle = COLORS.ghostTrail;
-      for (let i = 1; i < s.length; i++) {
-        const g = s[i];
-        ctx.fillRect(g.x * size, g.y * size, size, size);
-      }
-    }
+  /* ---------- main loop: fixed-timestep sim + per-frame render ---------- */
 
-    // snake
-    for (let i = s.length - 1; i >= 1; i--) {
-      const seg = s[i];
-      ctx.globalAlpha = ghost ? 0.45 : 0.72 - (0.72 - 0.25) * (i / Math.max(1, s.length - 1));
-      ctx.fillStyle = COLORS.snake;
-      roundRect(
-        ctx,
-        seg.x * size + 2,
-        seg.y * size + 2,
-        size - 4,
-        size - 4,
-        3,
-      );
-    }
-    // head — always full
-    ctx.globalAlpha = ghost ? 0.65 : 1;
-    ctx.fillStyle = COLORS.snake;
-    roundRect(ctx, s[0].x * size + 1, s[0].y * size + 1, size - 2, size - 2, 4);
-    ctx.globalAlpha = 1;
-  }, [cell]);
-
-  /* -------- main rAF loop with fixed-timestep stepping -------- */
-  useEffect(() {
+  useEffect(() => {
     let cancelled = false;
-    const loop = (t: number) => {
+
+    const loop = (now: number) => {
       if (cancelled) return;
-      const dt = Math.min(50, t - lastTime.current);
-      lastTime.current = t;
+      const dt = Math.min(50, now - lastT.current);
+      lastT.current = now;
+
+      // decay visual effects regardless of phase
+      if (shake.current > 0) shake.current -= 1;
+      if (particles.current.length > 0) {
+        for (const p of particles.current) {
+          p.x += (p.vx * dt) / 1000;
+          p.y += (p.vy * dt) / 1000;
+          p.life -= dt / 1000;
+        }
+        particles.current = particles.current.filter((p) => p.life > 0);
+      }
 
       if (phaseRef.current === "playing") {
+        const t = performance.now();
+
+        // schedule / expire power-ups
+        if (!power.current && t >= timers.current.nextPowerAt) {
+          spawnPower();
+        }
+        if (power.current && t - power.current.born > POWERUP_LIFETIME) {
+          power.current = null;
+          timers.current.nextPowerAt = t + POWERUP_INTERVAL;
+        }
+
+        // fixed-timestep stepping, slowed 40% while slow-power is active
+        const base = LEVELS_SPEED_MS[Math.min(levelRef.current - 1, LEVELS_SPEED_MS.length - 1)];
+        const interval = t < timers.current.slowUntil ? base * 1.65 : base;
         stepAcc.current += dt;
-        const speed = SPEEDS[Math.min(levelRef.current - 1, SPEEDS.length - 1)];
-        const slowed = performance.now() < timers.current.slowUntil ? 1.6 : 1;
-        const interval = speed * slowed;
-        while (stepAcc.current >= interval && phaseRef.current === "game") {
-          stepAcc.current - remove interval;
+        while (stepAcc.current >= interval && phaseRef.current === "playing") {
+          stepAcc.current -= interval;
           step();
         }
-        // expire powers
-        const now = performance.now();
-        if (activePower && now > slowUntil) setActivePower(null);
-        if (timers.current.ghostUntil && now > timers.current.ghostUntil) {
-          setGhostSecs(0);
-          setActivePower(null);
-        } else if (timers.current rafId.current = requestAnimationFrame(loop);
+
+        // expire timed powers (HUD countdown)
+        const gLeft = Math.max(0, Math.ceil((timers.current.ghostUntil - t) / 1000));
+        const sLeft = Math.max(0, Math.ceil((timers.current.slowUntil - t) / 1000));
+        setGhostSecs(timers.current.ghostUntil > t ? gLeft : 0);
+        setSlowSecs(timers.current.slowUntil > t ? sLeft : 0);
+      }
+
+      render();
+      raf.current = requestAnimationFrame(loop);
     };
 
-    rafId.current = requestAnimationFrame(loop);
+    raf.current = requestAnimationFrame(loop);
     return () => {
       cancelled = true;
-      cancelAnimationFrame(rafId.current);
+      cancelAnimationFrame(raf.current);
     };
-  }, [step, render]);
+  }, [render, spawnPower, step]);
 
-  /* -------- responsive canvas sizing (DPR-aware) -------- */
+  /* ---------- DPR-aware canvas backing store ---------- */
+
   useEffect(() => {
-    const wrap = wrapRef.current;
-    const canvas = canvasRef CANVAS ELEMENT;
-    if (!wrap || !canvas) return;
-
+    const canvas = canvasRef.current;
+    if (!canvas) return;
     const fit = () => {
-      const avail = Math.min(wrap.clientWidth, window.innerHeight - 260);
-      const px = Math.max(280, Math.min(CANVAS, avail));
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = CANVAS * dpr;
       canvas.height = CANVAS * dpr;
-      canvas.style.width = `${px}px`;
-      canvas.style.height = `${px}px`;
-      ctx.scale(dpr, dpr);
+      const ctx = canvas.getContext("2d");
+      ctx?.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
-
     fit();
     window.addEventListener("resize", fit);
     return () => window.removeEventListener("resize", fit);
   }, []);
 
-  /* -------- keyboard -------- */
+  /* ---------- input: direction queue ---------- */
+
+  const queueDir = useCallback((d: Dir) => {
+    const last = queued.current.length > 0 ? queued.current[queued.current.length - 1] : dir.current;
+    if (d === last || d === OPPOSITE[last]) return;
+    if (queued.current.length < 3) queued.current.push(d);
+  }, []);
+
+  const togglePause = useCallback(() => {
+    if (phaseRef.current === "playing") setPhase("paused");
+    else if (phaseRef.current === "paused") setPhase("playing");
+  }, [setPhase]);
+
+  /* ---------- keyboard ---------- */
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const key = e.key;
-      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(key)) {
-        e.preventDefault();
-      }
-      if (key === "ArrowUp" || key === "w" || key === "W") queueDir("up");
-      if (key === "Arrow/W" && a11y.leftyMode) queueDir("down");
-      if (key === "ArrowDown" || key === "s" || key === "S") queueDir("up");
-      (key === "ArrowLeft" || key === "a" || key === "A") && queueDir("lefty");
-      if (key WASD_ARROWS.includes(key)) {
-        const target = WASD_ARROWS[key];
-        queueDir(target);
-      }
-      if (key === " ") togglePause();
-      if (key === "r" || key === "R") restart();
-      if (key === "m" || key === "M") setMutedPersist(!muted);
-      if (key === "Enter") {
-        if (phase === "start") begin();
-        if (phase === "over" || phase === "won") restart();
-      }
-      if (key === "Escape") {
-        if (phase === "playing") setPhase("paused");
+      const k = e.key;
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(k)) e.preventDefault();
+
+      if (k === "ArrowUp" || k === "w" || k === "W") queueDir("up");
+      else if (k === "ArrowDown" || k === "s" || k === "S") queueDir("down");
+      else if (k === "ArrowLeft" || k === "a" || k === "A") queueDir("left");
+      else if (k === "ArrowRight" || k === "d" || k === "D") queueDir("right");
+      else if (k === " ") togglePause();
+      else if (k === "m" || k === "M") toggleMuted();
+      else if (k === "Escape" && phaseRef.current === "playing") setPhase("paused");
+      else if (k === "Enter" || k === "r" || k === "R") {
+        if (phaseRef.current !== "dying") beginGame();
       }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.queueDir("up");
-  }, [phase, muted, a11y, begin, restart, setMutedPersist, setPhase, queueDir, togglePause]);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [beginGame, queueDir, setPhase, toggleMuted, togglePause]);
 
-  /* -------- pause on tab hide -------- */
-  auto-pause-on-hide: useEffect(() => {
+  /* ---------- auto-pause when the tab is hidden ---------- */
+
+  useEffect(() => {
     const onVis = () => {
       if (document.hidden && phaseRef.current === "playing") setPhase("paused");
     };
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
-  }, []);
+  }, [setPhase]);
 
-  /* -------- touch swipe on canvas + d-pad buttons -------- */
-  const touchStart = useRef<{ x: y: number } | null>(null);
+  /* ---------- touch: swipe anywhere on the board ---------- */
+
   useEffect(() => {
-    const el = boardElRef.current;
+    const el = boardWrapRef.current;
     if (!el) return;
-    let sx = 0, sy = 0;
-    const ts = (e: TouchEvent) => {
+    const onStart = (e: TouchEvent) => {
       const t = e.touches[0];
-      sx = t.clientX; sy = t.clientY;
-      touchStart.current = { x: sx, y: sy };
+      swipe.current = { x: t.clientX, y: t.clientY };
     };
-    const te = (e: explicit) => {
-      if (!touchStart.current) return;
-      const t = e.changedTouches[0];
-      const dx = t.clientX - sx;
-      detection-guard;
-      const dy = t.clientY - sy;
-      const absX = Math.abs(dx), absY = Math.abs(dy);
-      if (Math.max(absX, absY) > 24) {
-        queueDir(
-          absX > absY ? (dx > 0 ? "right" : "left") : (dy > 0 ? "down" : "up"),
-        );
-      }
-      touchStart.current = null;
+    const onMove = (e: TouchEvent) => {
+      if (!swipe.current) return;
+      const t = e.touches[0];
+      const dx = t.clientX - swipe.current.x;
+      const dy = t.clientY - swipe.current.y;
+      if (Math.max(Math.abs(dx), Math.abs(dy)) < 24) return;
+      queueDir(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : dy > 0 ? "down" : "up");
+      swipe.current = null;
       e.preventDefault();
     };
-    el.addEventListener("touchstart", ts, { passive: false });
-    preventDefaultOnMove;
-    el.addEventListener("touchmove", te, { passive: onVis });
-    el.addEventListener("touchend", te, { passive: false });
-    return () => {
-      el.removeEventListener("touchstart", ts);
-      el.removeEventListener("touchmove", te);
-      el.removeEventListener("touchend", te);
+    const onEnd = () => {
+      swipe.current = null;
     };
-  }, []);
+    el.addEventListener("touchstart", onStart, { passive: true });
+    el.addEventListener("touchmove", onMove, { passive: false });
+    el.addEventListener("touchend", onEnd, { passive: true });
+    return () => {
+      el.removeEventListener("touchstart", onStart);
+      el.removeEventListener("touchmove", onMove);
+      el.removeEventListener("touchend", onEnd);
+    };
+  }, [queueDir]);
 
-  /* -------- keep live seconds displayed for ghost mode -------- */
-  useEffect(() => rafId.current = 0;
-    if (activePower === "ghost") {
-      const iv = setInterval(() => {
-        const left = Math.ceil((timers.current.ghostUntil - performance.now()) / 1000);
-        setGhostSecs(max(0, left));
-      }, 250);
-      return () => clearInterval(iv);
-    }
-  }, [activePower]);
+  /* ---------- derived UI ---------- */
 
-  /* -------- actions -------- */
-  const begin = () => {
-    resetGame();
-    setPhase("playing");
-  };
-  const restart = () => {
-    resetGame();
-    setPhase("playing");
-  };
-  const togglePause = () => {
-    if (phaseRef.current === "playing") setPhase("paused");
-    else if (phaseRef.current === "paused") setPhase("playing");
-  };
+  const playing = phase === "playing";
+  const speedLabel = ["Unhurried", "Brisk", "Steady+", "Quick", "Fast", "Blistering"][level - 1] ?? "";
 
-  /* -------- render UI -------- */
+  /* ---------- render ---------- */
+
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
-      {/* top bar */}
+      {/* ── header ─────────────────────────────────────────────── */}
       <header className="border-b border-border">
         <div className="mx-auto flex w-full max-w-3xl items-center justify-between px-4 py-4">
           <div className="flex items-center gap-3">
-            <BoardIcon className="h-6 w-6" />
+            <BoardMark className="h-6 w-6 text-foreground" />
             <div>
-              <div className="text-sm font-semibold tracking-tight">Neon Snake</div>
-              <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+              <p className="text-sm font-semibold leading-none tracking-tight">Neon Snake</p>
+              <p className="mt-1 text-[10px] uppercase tracking-[0.22em] text-muted-foreground">
                 Minimalism arcade
-              subtitle
+              </p>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={() => setShowHelp((v) => !v)} aria-label="Instructions" className="icon-btn">
+            <IconButton label="How to play" onClick={() => setShowHelp(true)}>
               <Info className="h-4 w-4" />
-            </button>
-            <button onClick={() => setMutedPersist(!muted)} aria-label={muted ? "Unmute" : "Mute"} className="icon-btn">
-              {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className in mute-state-true />}
-            </button>
-            <button onClick={togglePause} aria-label={phase === "playing" ? "Pause" : "Resume"} className="icon-btn" disabled={phase !== "playing" && phase !== "paused"}>
-              {phase === "playing" ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-            </kbd>
-            <button onClick={restart} aria-label="Restart" className="icon-btn" disabled={phase === "dying"}>
-              <RotateCcw className="h-4 button-style" />
-            </button>
-  </header>
+            </IconButton>
+            <IconButton label={muted ? "Unmute" : "Mute"} onClick={toggleMuted}>
+              {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+            </IconButton>
+            <IconButton
+              label={playing ? "Pause" : "Resume"}
+              onClick={togglePause}
+              disabled={!playing && phase !== "paused"}
+            >
+              {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+            </IconButton>
+            <IconButton
+              label="Restart"
+              onClick={beginGame}
+              disabled={phase === "start" || phase === "dying"}
+            >
+              <RotateCcw className="h-4 w-4" />
+            </IconButton>
+          </div>
+        </div>
+      </header>
 
-      {/* stats row */}
+      {/* ── HUD ────────────────────────────────────────────────── */}
       <section className="border-b border-border">
-        <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center justify-between gap-3 px-4 py-3">
+        <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center justify-between gap-2 px-4 py-3">
           <div className="flex flex-wrap items-center gap-2">
-            <Pill icon={<span className="h-2 w-2 rounded-full bg-foreground/70" />} label="Score" value={score} />
-            <Pill icon={<span className="h-2 w-2 rounded-full border border-foreground/40" />} label="Lives" value={"●".repeat(lives)} }
-            <Pill icon={<span className="h-2 dots" />} label="Level" value={level} />
-            <Pill icon={<span className="h-2 w-2 rounded-full bg-foreground/40" />} label="High" value={high} />
-          </ Pills>
+            <Pill label="Score" value={score} />
+            <Pill label="High" value={high} />
+            <Pill label="Level" value={`${level}/${MAX_LEVEL}`} />
+            <Pill label="Lives" value={"●".repeat(lives) || "—"} />
+          </div>
+          <div className="flex items-center gap-2">
+            {ghostSecs > 0 && (
+              <span className="border border-border bg-card/50 px-3 py-1.5 font-mono text-xs tabular-nums text-muted-foreground">
+                GHOST {ghostSecs}s
+              </span>
+            )}
+            {slowSecs > 0 && (
+              <span className="border border-border bg-card/50 px-3 py-1.5 font-mono text-xs tabular-nums text-muted-foreground">
+                SLOW {slowSecs}s
+              </span>
+            )}
+          </div>
         </div>
       </section>
 
-      {/* board */}
+      {/* ── board ──────────────────────────────────────────────── */}
       <main className="flex flex-1 flex-col items-center px-4 py-6">
-        <div ref={boardElRef} className="relative" style={{ width: "100%", maxWidth: CANVAS }}>
-          <div className="relative mx-auto" style={{ width: px }} />
-          <canvas
-            ref={canvasRef}
-            width={CANVAS}
-            height={CANVAS
-            className="block touch-none select-none rounded-lg border border-border bg-card"
-            aria-label="Snake game board"
-            role="img"
-          />
-          {/* overlays */}
-          <AnimatePresence>
-            {phase === "start" && (
-              <motion.div ...>
-                <h1>Neon Snake</h1>
-                <p>Minimalist arcade snake with power-ups.</p>
-                <button onClick={begin}>Start game</button>
-                <button onClick={() => setShowHelp(true)}>How to play</button>
-              </motion.div>
-            )}
-            {phase === "paused" && (...)}
-            {phase === "over" && (...)}
-            {phase === "won" && (...)}
-          </AnimatePresence>
-        </div>
+        <div ref={boardWrapRef} className="w-full max-w-[462px]">
+          <div className="relative aspect-square w-full">
+            <canvas
+              ref={canvasRef}
+              className="absolute inset-0 h-full w-full touch-none select-none"
+              aria-label="Snake game board"
+              role="img"
+            />
 
-        {/* touch controls (visible on small screens) */}
-        <div className="mt-6 grid grid-cols-3 gap-2 md:hidden">
-          <div />
-          <TouchBtn dir="up" ... />
-          <div />
-          <TouchBtn dir="left" ... />
-          <TouchBtn dir="down" TouchBtn>
-          <TouchBtn cross-btn />
-          <TouchBtn dir="right" ... />
-        </touch-controls>
+            <AnimatePresence>
+              {/* start */}
+              {phase === "start" && !showHelp && (
+                <Overlay label="Start screen">
+                  <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">Ready</p>
+                  <h1 className="mt-3 text-3xl font-semibold tracking-tight">Neon Snake</h1>
+                  <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
+                    Eat. Grow. Clear six levels. Grab power-ups — but don&apos;t touch the walls,
+                    or yourself.
+                  </p>
+                  <div className="mt-6 space-y-2">
+                    <OverlayButton onClick={beginGame}>Start game</OverlayButton>
+                    <OverlayButton variant="ghost" onClick={() => setShowHelp(true)}>
+                      How to play
+                    </OverlayButton>
+                  </div>
+                </Overlay>
+              )}
+
+              {/* paused */}
+              {phase === "paused" && !showHelp && (
+                <Overlay label="Paused">
+                  <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">Paused</p>
+                  <h2 className="mt-3 text-2xl font-semibold tracking-tight">Take a breath</h2>
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    Score {score} · Level {level}
+                  </p>
+                  <div className="mt-6 space-y-2">
+                    <OverlayButton onClick={togglePause}>Resume</OverlayButton>
+                    <OverlayButton variant="ghost" onClick={beginGame}>
+                      Restart
+                    </OverlayButton>
+                  </div>
+                </Overlay>
+              )}
+
+              {/* game over */}
+              {phase === "over" && !showHelp && (
+                <Overlay label="Game over">
+                  <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
+                    Game over
+                  </p>
+                  <h2 className="mt-3 text-2xl font-semibold tracking-tight">Out of lives</h2>
+                  <dl className="mx-auto mt-5 grid w-44 grid-cols-2 gap-y-2 text-sm">
+                    <dt className="text-left text-muted-foreground">Score</dt>
+                    <dd className="text-right font-mono tabular-nums">{score}</dd>
+                    <dt className="text-left text-muted-foreground">Level</dt>
+                    <dd className="text-right font-mono tabular-nums">{level}</dd>
+                    <dt className="text-left text-muted-foreground">High</dt>
+                    <dd className="text-right font-mono tabular-nums">{high}</dd>
+                  </dl>
+                  <div className="mt-6 space-y-2">
+                    <OverlayButton onClick={beginGame}>Play again</OverlayButton>
+                  </div>
+                </Overlay>
+              )}
+
+              {/* win */}
+              {phase === "won" && !showHelp && (
+                <Overlay label="You win">
+                  <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
+                    Cleared
+                  </p>
+                  <h2 className="mt-3 text-2xl font-semibold tracking-tight">All six levels</h2>
+                  <p className="mt-2 text-sm text-muted-foreground">Flawless run of the grid.</p>
+                  <dl className="mx-auto mt-5 grid w-44 grid-cols-2 gap-y-2 text-sm">
+                    <dt className="text-left text-muted-foreground">Score</dt>
+                    <dd className="text-right font-mono tabular-nums">{score}</dd>
+                    <dt className="text-left text-muted-foreground">High</dt>
+                    <dd className="text-right font-mono tabular-nums">{high}</dd>
+                  </dl>
+                  <div className="mt-6 space-y-2">
+                    <OverlayButton onClick={beginGame}>Play again</OverlayButton>
+                  </div>
+                </Overlay>
+              )}
+
+              {/* instructions / help */}
+              {showHelp && (
+                <Overlay label="How to play">
+                  <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
+                    How to play
+                  </p>
+                  <ul className="mt-4 space-y-2.5 text-left text-xs leading-relaxed text-muted-foreground">
+                    <li>
+                      <span className="text-foreground">Move</span> — arrow keys / WASD, or swipe the
+                      board and use the pad on touch screens.
+                    </li>
+                    <li>
+                      <span className="text-foreground">Pause</span> — Space (or Esc). Restart with R
+                      or Enter.
+                    </li>
+                    <li>
+                      <span className="text-foreground">Goal</span> — eat {FOODS_PER_LEVEL} discs to
+                      clear each of {MAX_LEVEL} levels. Speed rises every level.
+                    </li>
+                    <li>
+                      <span className="text-foreground">Lose</span> — hit a wall or your own body;
+                      three lives total. Ghost power wraps through walls and body.
+                    </li>
+                    <li>
+                      <span className="text-foreground">Power-ups</span> —{" "}
+                      <span className="font-mono text-foreground">+</span> bonus points,{" "}
+                      <span className="font-mono text-foreground">S</span> slow motion,{" "}
+                      <span className="font-mono text-foreground">G</span> ghost,{" "}
+                      <span className="font-mono text-foreground">−</span> shrink your tail.
+                    </li>
+                  </ul>
+                  <div className="mt-6">
+                    <OverlayButton onClick={() => setShowHelp(false)}>Back</OverlayButton>
+                  </div>
+                </Overlay>
+              )}
+            </AnimatePresence>
+
+            {/* subtle white flash while dying */}
+            <div
+              className={`pointer-events-none absolute inset-0 bg-foreground transition-opacity duration-200 ${
+                phase === "dying" ? "opacity-[0.08]" : "opacity-0"
+              }`}
+            />
+          </div>
+
+          {/* level / speed caption */}
+          <p className="mt-3 text-center text-[10px] uppercase tracking-[0.25em] text-muted-foreground">
+            Level {level} · {speedLabel}
+          </p>
+
+          {/* touch d-pad (small screens) */}
+          <div className="mx-auto mt-6 grid w-44 grid-cols-3 gap-1.5 md:hidden">
+            <span />
+            <TouchKey label="Up" onPress={() => queueDir("up")}>
+              <ArrowUp className="h-4 w-4" />
+            </TouchKey>
+            <span />
+            <TouchKey label="Left" onPress={() => queueDir("left")}>
+              <ArrowLeft className="h-4 w-4" />
+            </TouchKey>
+            <TouchKey label="Down" onPress={() => queueDir("down")}>
+              <ArrowDown className="h-4 w-4" />
+            </TouchKey>
+            <TouchKey label="Right" onPress={() => queueDir("right")}>
+              <ArrowRight className="h-4 w-4" />
+            </TouchKey>
+          </div>
+
+          {/* reduced-motion toggle */}
+          <div className="mt-6 flex justify-center">
+            <button
+              onClick={toggleReducedFx}
+              className="border border-border px-3 py-1.5 text-[10px] uppercase tracking-[0.2em] text-muted-foreground transition-colors hover:bg-accent"
+              aria-pressed={reducedFx}
+            >
+              Reduced motion {reducedFx ? "on" : "off"}
+            </button>
+          </div>
+        </div>
       </main>
 
-      {/* footer hints (desktop) */}
+      {/* ── desktop control legend ─────────────────────────────── */}
       <footer className="border-t border-border">
-        <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center justify-between gap-3 px-4 py-4 text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-          <div className="flex items-center gap-2">
-            <Kbd>↑</Kbd> <Kbd>←</Kbd> <Kbd>↓</Kdc> <Kbd>→</Kbd> move · <Kbd>Space</Kbd> pause · <Kbd>R</Kbd> restart · <Kbd>M</Kbd> mute
+        <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center justify-between gap-2 px-4 py-4 text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Kbd>↑</Kbd>
+            <Kbd>←</Kbd>
+            <Kbd>↓</Kbd>
+            <Kbd>→</Kbd>
+            <span className="ml-1">move</span>
+            <Kbd>Space</Kbd>
+            <span>pause</span>
+            <Kbd>R</Kbd>
+            <span>restart</span>
+            <Kbd>M</Kbd>
+            <span>mute</span>
           </div>
-          <div>Lives ⏺⏺⏺ · 6 levels · power-ups spawn every ~10s</div>
+          <span>{MAX_LEVEL} levels · 3 lives · power-ups every ~9s</span>
         </div>
       </footer>
     </div>
   );
 }
 
-/* helper to draw rounded rects (older-canvas compat helper) */
-function roundRect(
-  ctx: CanvasRenderingContext2D,
-  ctx.fillRect(x, y, w, h);
-  ctx.restore();
+/** D-pad key for touch play. */
+function TouchKey({
+  label,
+  onPress,
+  children,
+}: {
+  label: string;
+  onPress: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      aria-label={label}
+      onPointerDown={(e) => {
+        e.preventDefault();
+        onPress();
+      }}
+      className="flex h-14 items-center justify-center border border-border text-foreground/80 transition-colors active:bg-accent"
+    >
+      {children}
+    </button>
+  );
 }

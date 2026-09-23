@@ -1,4 +1,9 @@
 # Neon Snake
+<img width="986" height="641" alt="Screenshot 2026-09-23 135809" src="https://github.com/user-attachments/assets/6cad84e9-3ccf-4f38-933d-2649cc7a627f" />
+
+
+https://github.com/user-attachments/assets/cb7597b2-968e-4191-bd5a-07252e116eaa
+
 
 A minimalist take on classic Snake — eat, grow, and survive across 6 levels of rising speed, with a handful of power-ups to bend the rules along the way.
 

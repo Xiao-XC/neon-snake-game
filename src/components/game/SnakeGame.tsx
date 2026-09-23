@@ -509,6 +509,7 @@ export default function SnakeGame() {
     const a = ACHIEVEMENTS.find((x) => x.id === id);
     if (a) {
       setAchToast(a);
+      // auto-dismiss the unlock toast
       window.setTimeout(() => setAchToast(null), 2800);
     }
     sfx.current?.achievement();

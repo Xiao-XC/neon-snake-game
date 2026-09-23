@@ -23,6 +23,13 @@ export const LEVELS_SPEED_MS = [
   170, 158, 146, 135, 124, 114, 105, 97, 89, 82, 76, 70, 64, 58, 52,
 ];
 
+/** One label per level for the caption under the board. */
+export const SPEED_LABELS = [
+  "Unhurried", "Brisk", "Steady", "Quick", "Swift",
+  "Fast", "Faster", "Rapid", "Rushing", "Hasty",
+  "Nimble", "Blistering", "Hypersonic", "Ludicrous", "Terminal",
+];
+
 export const POWERUP_INTERVAL = 9000; // ms between power-up spawns
 export const POWERUP_LIFETIME = 7000; // ms a power-up stays on the board
 export const GHOST_MS = 5000; // ghost (phase through everything) duration

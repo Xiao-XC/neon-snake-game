@@ -3,14 +3,21 @@
  *
  * Rendering: HTML5 <canvas>, fixed 21×21 logical grid, DPR-aware backing
  * store, requestAnimationFrame loop with a fixed-timestep simulation.
+ *          The static layer (background, dot grid, obstacles) is prebaked to
+ *          an offscreen canvas once per zone/level and blitted per frame —
+ *          keeps the per-frame cost flat and the game smooth on mobile.
  * Input:   keyboard (arrows/WASD/Space/R/M/Enter) + touch swipe + on-screen
  *          d-pad on small screens.
  * Audio:   procedural WebAudio blips (no asset files), with mute toggle.
- * Storage: high score / mute / reduced-fx persisted in localStorage.
- * Visuals: near-monochrome palette, generated shapes only — no assets.
+ * Storage: high score / best level / mute / reduced-fx / skins /
+ *          achievements persisted in localStorage.
+ * Visuals: near-monochrome minimalism theme with unlockable neon snake
+ *          colors; the board recolors every 3 levels (5 color zones) and
+ *          obstacles appear from level 3. Generated shapes only — no assets.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowDown,
@@ -18,66 +25,67 @@ import {
   ArrowRight,
   ArrowUp,
   Info,
+  Lock,
   Pause,
   Play,
   RotateCcw,
+  Trophy,
   Volume2,
   VolumeX,
 } from "lucide-react";
+import {
+  ACHIEVEMENTS,
+  CANVAS,
+  CELL,
+  DIR_V,
+  FOODS_PER_LEVEL,
+  GHOST_MS,
+  GRID,
+  LEVELS_SPEED_MS,
+  MAX_LEVEL,
+  MAX_PARTICLES,
+  OPPOSITE,
+  POINTS_BONUS,
+  POINTS_FOOD,
+  POWERUP_INTERVAL,
+  POWERUP_LIFETIME,
+  POWER_LETTER,
+  RESPAWN_MS,
+  SKINS,
+  SLOW_MS,
+  SPEED_LABELS,
+  START_LIVES,
+  ZONES,
+  buildObstacles,
+  cssForSkin,
+  hexLerp,
+  skinById,
+  unlockText,
+  zoneForLevel,
+  zoneIndexForLevel,
+  type Achievement,
+  type Dir,
+  type Phase,
+  type PowerType,
+  type Pt,
+  type Skin,
+} from "./config";
 
 /* ------------------------------------------------------------------ */
-/*  Constants                                                          */
+/*  Local types + storage keys                                         */
 /* ------------------------------------------------------------------ */
-
-const GRID = 21; // grid is 21×21 cells (odd → symmetric centre spawn)
-const CANVAS = 462; // logical canvas size in px (GRID × 22px cells)
-const CELL = CANVAS / GRID; // logical size of one cell
-
-const START_LIVES = 3;
-const MAX_LEVEL = 6;
-const FOODS_PER_LEVEL = 8;
-const POINTS_FOOD = 10;
-const POINTS_BONUS = 40;
-const LEVELS_SPEED_MS = [170, 145, 122, 102, 86, 72]; // ms per step per level
-const POWERUP_INTERVAL = 9000; // ms between power-up spawns
-const POWERUP_LIFETIME = 7000; // ms a power-up stays on the board
-const GHOST_MS = 5000; // ghost (wrap-through) duration
-const SLOW_MS = 6000; // slow-motion duration
-const RESPAWN_MS = 900; // death pause before respawn / game over
-
-/** Near-monochrome palette aligned with the minimalism theme tokens. */
-const C = {
-  bg: "#0b0b0c",
-  dot: "rgba(255,255,255,0.05)",
-  border: "rgba(255,255,255,0.14)",
-  snake: "#ffffff",
-  food: "#e4e4e7",
-  ink: "#0b0b0c",
-  particle: "#ffffff",
-  ghostTrail: "rgba(255,255,255,0.10)",
-};
 
 const LS = {
   high: "neon-snake:high",
+  bestLevel: "neon-snake:best-level",
   muted: "neon-snake:muted",
   fx: "neon-snake:reduced-fx",
+  skin: "neon-snake:skin",
+  ach: "neon-snake:achievements",
 };
 
-type Pt = { x: number; y: number };
-type Dir = "up" | "down" | "left" | "right";
-type Phase = "start" | "playing" | "paused" | "dying" | "over" | "won";
-type PowerType = "bonus" | "slow" | "ghost" | "shrink";
 type PowerUp = { cell: Pt; type: PowerType; born: number };
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; max: number };
-
-const DIR_V: Record<Dir, Pt> = {
-  up: { x: 0, y: -1 },
-  down: { x: 0, y: 1 },
-  left: { x: -1, y: 0 },
-  right: { x: 1, y: 0 },
-};
-const OPPOSITE: Record<Dir, Dir> = { up: "down", down: "up", left: "right", right: "left" };
-const POWER_LETTER: Record<PowerType, string> = { bonus: "+", slow: "S", ghost: "G", shrink: "−" };
 
 /* ------------------------------------------------------------------ */
 /*  Tiny helpers                                                       */
@@ -97,11 +105,19 @@ function lsSet(key: string, value: string) {
     /* storage unavailable (private mode) — non-fatal */
   }
 }
+function lsGetJSON<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
 function randCell(): number {
   return Math.floor(Math.random() * GRID);
 }
 
-/** Rounded-rect path (used for snake segments). */
+/** Rounded-rect path (used for the snake head). */
 function roundRect(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -175,6 +191,16 @@ class Sfx {
     this.beep(660, 0.1, "square", 0.08, 0.09);
     this.beep(880, 0.16, "square", 0.08, 0.18);
   }
+  zone() {
+    this.beep(392, 0.12, "triangle", 0.1);
+    this.beep(523, 0.12, "triangle", 0.1, 0.1);
+    this.beep(659, 0.12, "triangle", 0.1, 0.2);
+    this.beep(784, 0.2, "triangle", 0.1, 0.3);
+  }
+  achievement() {
+    this.beep(880, 0.09, "triangle", 0.09);
+    this.beep(1175, 0.14, "triangle", 0.09, 0.09);
+  }
   die() {
     this.beep(220, 0.16, "square", 0.12);
     this.beep(160, 0.18, "square", 0.12, 0.14);
@@ -230,9 +256,11 @@ function BoardMark({ className = "h-6 w-6" }: { className?: string }) {
 function Overlay({
   children,
   label,
+  wide,
 }: {
   children: React.ReactNode;
   label: string;
+  wide?: boolean;
 }) {
   return (
     <motion.div
@@ -244,7 +272,7 @@ function Overlay({
       role="dialog"
       aria-label={label}
     >
-      <div className="w-full max-w-xs px-6 text-center">{children}</div>
+      <div className={`w-full px-6 text-center ${wide ? "max-w-sm" : "max-w-xs"}`}>{children}</div>
     </motion.div>
   );
 }
@@ -303,10 +331,14 @@ function IconButton({
 /* ------------------------------------------------------------------ */
 
 export default function SnakeGame() {
+  const navigate = useNavigate();
+
   /* ---------- mutable game state (refs — never trigger re-render) ---------- */
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const staticRef = useRef<HTMLCanvasElement | null>(null); // prebaked board layer
   const boardWrapRef = useRef<HTMLDivElement | null>(null);
   const snake = useRef<Pt[]>([]);
+  const obstacles = useRef<Pt[]>([]);
   const dir = useRef<Dir>("right");
   const queued = useRef<Dir[]>([]);
   const food = useRef<Pt>({ x: 0, y: 0 });
@@ -325,6 +357,14 @@ export default function SnakeGame() {
   const fxRef = useRef(false); // true → reduced motion
   const swipe = useRef<{ x: number; y: number } | null>(null);
   const sfx = useRef<Sfx | null>(null);
+  const skinRef = useRef<Skin>(skinById(lsGet(LS.skin) ?? "mono"));
+  const zoneIdxRef = useRef(0);
+  const powersTaken = useRef(0);
+  const flawlessStreak = useRef(0);
+  const diedThisLevel = useRef(false);
+  const lastGhostShown = useRef(0);
+  const lastSlowShown = useRef(0);
+  const achRef = useRef<Set<string>>(new Set(lsGetJSON<string[]>(LS.ach, [])));
 
   /* ---------- reactive state (only what the HUD/overlays show) ---------- */
   const [phase, setPhaseState] = useState<Phase>("start");
@@ -332,30 +372,40 @@ export default function SnakeGame() {
   const [lives, setLives] = useState(START_LIVES);
   const [level, setLevel] = useState(1);
   const [high, setHigh] = useState(() => Number(lsGet(LS.high) ?? 0));
+  const [bestLevel, setBestLevel] = useState(() => Number(lsGet(LS.bestLevel) ?? 1));
   const [muted, setMuted] = useState(() => lsGet(LS.muted) === "1");
   const [reducedFx, setReducedFx] = useState(() => lsGet(LS.fx) === "1");
+  const [skinId, setSkinId] = useState(() => lsGet(LS.skin) ?? "mono");
+  const [unlocked, setUnlocked] = useState<string[]>(() => [...achRef.current]);
   const [ghostSecs, setGhostSecs] = useState(0);
   const [slowSecs, setSlowSecs] = useState(0);
   const [showHelp, setShowHelp] = useState(false);
+  const [showSkins, setShowSkins] = useState(false);
+  const [showAch, setShowAch] = useState(false);
+  const [skinHint, setSkinHint] = useState<string | null>(null);
+  const [zoneBanner, setZoneBanner] = useState<string | null>(null);
+  const [achToast, setAchToast] = useState<Achievement | null>(null);
+  const [zoneIdx, setZoneIdx] = useState(0);
 
   const setPhase = useCallback((p: Phase) => {
     phaseRef.current = p;
     setPhaseState(p);
   }, []);
 
-  /* lazily construct Sfx on first client render */
+  /* lazily construct Sfx on first client render + seed the static board */
   useEffect(() => {
     sfx.current = new Sfx();
     sfx.current.muted = muted;
     fxRef.current = reducedFx;
-    // Seed a static board so the pre-game render has something to draw.
     const cx = Math.floor(GRID / 2);
     snake.current = [
       { x: cx - 1, y: cx },
       { x: cx - 2, y: cx },
       { x: cx - 3, y: cx },
     ];
+    obstacles.current = buildObstacles(1);
     spawnFood();
+    bakeStatic();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -382,23 +432,120 @@ export default function SnakeGame() {
     });
   }, []);
 
+  /* ---------- achievements ---------- */
+
+  const unlock = useCallback((id: string) => {
+    if (achRef.current.has(id)) return;
+    achRef.current.add(id);
+    lsSet(LS.ach, JSON.stringify([...achRef.current]));
+    setUnlocked([...achRef.current]);
+    const a = ACHIEVEMENTS.find((x) => x.id === id);
+    if (a) {
+      setAchToast(a);
+      window.setTimeout(() => setAchToast(null), 2800);
+    }
+    sfx.current?.achievement();
+  }, []);
+
+  /* ---------- score + skins ---------- */
+
   /** Add points; keep the high score live-updated and persisted. */
-  const addScore = useCallback((n: number) => {
-    scoreRef.current += n;
-    setScore(scoreRef.current);
-    setHigh((h) => {
-      if (scoreRef.current > h) {
-        lsSet(LS.high, String(scoreRef.current));
-        return scoreRef.current;
+  const addScore = useCallback(
+    (n: number) => {
+      scoreRef.current += n;
+      setScore(scoreRef.current);
+      if (scoreRef.current >= 500) unlock("score-500");
+      if (scoreRef.current >= 1500) unlock("score-1500");
+      setHigh((h) => {
+        if (scoreRef.current > h) {
+          lsSet(LS.high, String(scoreRef.current));
+          return scoreRef.current;
+        }
+        return h;
+      });
+    },
+    [unlock],
+  );
+
+  const pickSkin = useCallback(
+    (s: Skin) => {
+      if (!isSkinUnlocked(s).ok) {
+        setSkinHint(unlockText(s.unlock));
+        return;
       }
-      return h;
-    });
+      setSkinId(s.id);
+      skinRef.current = s;
+      lsSet(LS.skin, s.id);
+      setSkinHint(null);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [unlocked, high, bestLevel],
+  );
+
+  function isSkinUnlocked(s: Skin): { ok: boolean; hint: string } {
+    const u = s.unlock;
+    switch (u.type) {
+      case "free":
+        return { ok: true, hint: "" };
+      case "level":
+        return {
+          ok: bestLevel >= u.value,
+          hint: `Reach level ${u.value} — best so far: ${bestLevel}`,
+        };
+      case "score":
+        return {
+          ok: high >= u.value,
+          hint: `Score ${u.value.toLocaleString()} in one run — best: ${high.toLocaleString()}`,
+        };
+      case "achievement": {
+        const a = ACHIEVEMENTS.find((x) => x.id === u.id);
+        return { ok: achRef.current.has(u.id), hint: a ? unlockText(u) : "" };
+      }
+    }
+  }
+
+  const isSkinUnlockedStable = useCallback(isSkinUnlocked, [bestLevel, high, unlocked]);
+
+  const unlockedSkinCount = useMemo(
+    () => SKINS.filter((s) => isSkinUnlockedStable(s).ok).length,
+    [isSkinUnlockedStable],
+  );
+
+  /* ---------- static layer (background + dots + obstacles) ---------- */
+
+  /** Rebuild the prebaked board layer for the current level's zone + obstacles. */
+  const bakeStatic = useCallback(() => {
+    let c = staticRef.current;
+    if (!c) {
+      c = document.createElement("canvas");
+      staticRef.current = c;
+    }
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    c.width = CANVAS * dpr;
+    c.height = CANVAS * dpr;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const z = zoneForLevel(levelRef.current);
+    ctx.fillStyle = z.bg;
+    ctx.fillRect(0, 0, CANVAS, CANVAS);
+    ctx.fillStyle = z.dot;
+    for (let y = 0; y < GRID; y++) {
+      for (let x = 0; x < GRID; x++) {
+        ctx.fillRect(x * CELL + CELL / 2 - 1, y * CELL + CELL / 2 - 1, 2, 2);
+      }
+    }
+    ctx.fillStyle = z.wall;
+    for (const o of obstacles.current) {
+      ctx.fillRect(o.x * CELL + 2, o.y * CELL + 2, CELL - 4, CELL - 4);
+    }
   }, []);
 
   /* ---------- spawning ---------- */
 
   const spawnFood = useCallback(() => {
     const taken = new Set(snake.current.map((p) => `${p.x},${p.y}`));
+    for (const o of obstacles.current) taken.add(`${o.x},${o.y}`);
     if (power.current) taken.add(`${power.current.cell.x},${power.current.cell.y}`);
     let x = 0;
     let y = 0;
@@ -411,6 +558,7 @@ export default function SnakeGame() {
 
   const spawnPower = useCallback(() => {
     const taken = new Set(snake.current.map((p) => `${p.x},${p.y}`));
+    for (const o of obstacles.current) taken.add(`${o.x},${o.y}`);
     taken.add(`${food.current.x},${food.current.y}`);
     let x = 0;
     let y = 0;
@@ -426,6 +574,7 @@ export default function SnakeGame() {
   /** Particle burst at a logical board position. */
   const burst = useCallback((x: number, y: number, count: number) => {
     if (fxRef.current) return;
+    if (particles.current.length > MAX_PARTICLES) return;
     for (let i = 0; i < count; i++) {
       const a = Math.random() * Math.PI * 2;
       const sp = 40 + Math.random() * 110;
@@ -438,6 +587,9 @@ export default function SnakeGame() {
         max: 0.8,
       });
     }
+    if (particles.current.length > MAX_PARTICLES) {
+      particles.current = particles.current.slice(-MAX_PARTICLES);
+    }
   }, []);
 
   /* ---------- power-up pickup ---------- */
@@ -445,6 +597,8 @@ export default function SnakeGame() {
   const applyPower = useCallback(
     (type: PowerType) => {
       const now = performance.now();
+      powersTaken.current += 1;
+      if (powersTaken.current >= 4) unlock("collector");
       switch (type) {
         case "bonus":
           addScore(POINTS_BONUS);
@@ -465,7 +619,7 @@ export default function SnakeGame() {
       }
       sfx.current?.power();
     },
-    [addScore],
+    [addScore, unlock],
   );
 
   /* ---------- lifecycle: reset / death / win ---------- */
@@ -486,15 +640,26 @@ export default function SnakeGame() {
     levelRef.current = 1;
     setLevel(1);
     eatenRef.current = 0;
-    timers.current = { ghostUntil: 0, slowUntil: 0, nextPowerAt: performance.now() + POWERUP_INTERVAL };
+    powersTaken.current = 0;
+    flawlessStreak.current = 0;
+    diedThisLevel.current = false;
+    obstacles.current = buildObstacles(1);
+    timers.current = {
+      ghostUntil: 0,
+      slowUntil: 0,
+      nextPowerAt: performance.now() + POWERUP_INTERVAL,
+    };
     power.current = null;
     particles.current = [];
     shake.current = 0;
     stepAcc.current = 0;
+    zoneIdxRef.current = 0;
+    setZoneIdx(0);
     setGhostSecs(0);
     setSlowSecs(0);
+    bakeStatic();
     spawnFood();
-  }, [spawnFood]);
+  }, [bakeStatic, spawnFood]);
 
   const beginGame = useCallback(() => {
     resetRun();
@@ -513,17 +678,21 @@ export default function SnakeGame() {
     power.current = null;
     timers.current.ghostUntil = 0;
     timers.current.slowUntil = 0;
+    obstacles.current = buildObstacles(levelRef.current); // same seed → same layout
     setGhostSecs(0);
     setSlowSecs(0);
     stepAcc.current = 0;
+    bakeStatic();
     spawnFood();
     setPhase("playing");
-  }, [spawnFood, setPhase]);
+  }, [bakeStatic, spawnFood, setPhase]);
 
   /** Death sequence: burst, shake, pause, then respawn or game over. */
   const die = useCallback(() => {
     setPhase("dying");
     sfx.current?.die();
+    diedThisLevel.current = true;
+    flawlessStreak.current = 0;
     const head = snake.current[0];
     burst((head.x + 0.5) * CELL, (head.y + 0.5) * CELL, 20);
     if (!fxRef.current) shake.current = 10;
@@ -541,8 +710,48 @@ export default function SnakeGame() {
 
   const winGame = useCallback(() => {
     setPhase("won");
+    unlock("champion");
     sfx.current?.win();
-  }, [setPhase]);
+  }, [setPhase, unlock]);
+
+  /* ---------- level progression ---------- */
+
+  /** Advance to the next level: rebuild obstacles, recolor zone, celebrate. */
+  const advanceLevel = useCallback(() => {
+    eatenRef.current = 0;
+    levelRef.current += 1;
+    setLevel(levelRef.current);
+    const lvl = levelRef.current;
+    if (lvl > bestLevel) {
+      setBestLevel(lvl);
+      lsSet(LS.bestLevel, String(lvl));
+    }
+    if (lvl >= 5) unlock("level-5");
+    if (!diedThisLevel.current) {
+      flawlessStreak.current += 1;
+      if (flawlessStreak.current >= 3) unlock("flawless");
+    } else {
+      flawlessStreak.current = 0;
+    }
+    diedThisLevel.current = false;
+    obstacles.current = buildObstacles(lvl);
+
+    const zi = zoneIndexForLevel(lvl);
+    const zoneChanged = zi !== zoneIdxRef.current;
+    if (zoneChanged) {
+      zoneIdxRef.current = zi;
+      setZoneIdx(zi);
+      const z = zoneForLevel(lvl);
+      setZoneBanner(z.name);
+      window.setTimeout(() => setZoneBanner(null), 1900);
+      if (zi >= 1) unlock("zone-2");
+      if (zi >= 3) unlock("zone-4");
+      sfx.current?.zone();
+    } else {
+      sfx.current?.levelUp();
+    }
+    bakeStatic();
+  }, [bakeStatic, bestLevel, unlock]);
 
   /* ---------- one simulation step (fixed timestep) ---------- */
 
@@ -571,6 +780,13 @@ export default function SnakeGame() {
     if (out) {
       hx = (hx + GRID) % GRID; // ghost mode wraps through walls
       hy = (hy + GRID) % GRID;
+      unlock("ghost-save");
+    }
+
+    // obstacle collision (ghost phases through)
+    if (!ghost && obstacles.current.some((o) => o.x === hx && o.y === hy)) {
+      die();
+      return;
     }
 
     // self collision (ignore the tail cell — it moves away this step)
@@ -592,15 +808,13 @@ export default function SnakeGame() {
       eatenRef.current += 1;
       sfx.current?.eat();
       burst((hx + 0.5) * CELL, (hy + 0.5) * CELL, 8);
+      unlock("first-meal");
       if (eatenRef.current >= FOODS_PER_LEVEL) {
-        eatenRef.current = 0;
         if (levelRef.current >= MAX_LEVEL) {
           winGame();
           return;
         }
-        levelRef.current += 1;
-        setLevel(levelRef.current);
-        sfx.current?.levelUp();
+        advanceLevel();
       }
       spawnFood();
     } else {
@@ -614,18 +828,21 @@ export default function SnakeGame() {
       timers.current.nextPowerAt = performance.now() + POWERUP_INTERVAL;
       applyPower(type);
     }
-  }, [addScore, applyPower, burst, die, spawnFood, winGame]);
+  }, [addScore, advanceLevel, applyPower, burst, die, spawnFood, unlock, winGame]);
 
   /* ---------- frame render ---------- */
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
-    if (!canvas || !ctx) return;
-    const t = performance.now();
+    const stat = staticRef.current;
+    if (!canvas || !ctx || !stat) return;
+    const now = performance.now();
     const s = snake.current;
     if (s.length === 0) return; // nothing seeded yet (first frames)
-    const ghost = t < timers.current.ghostUntil;
+    const ghost = now < timers.current.ghostUntil;
+    const z = zoneForLevel(levelRef.current);
+    const skin = skinRef.current;
 
     ctx.clearRect(0, 0, CANVAS, CANVAS);
 
@@ -636,72 +853,77 @@ export default function SnakeGame() {
       ctx.translate((Math.random() - 0.5) * d * 6, (Math.random() - 0.5) * d * 6);
     }
 
-    // background + dot grid
-    ctx.fillStyle = C.bg;
-    ctx.fillRect(0, 0, CANVAS, CANVAS);
-    ctx.fillStyle = C.dot;
-    for (let y = 0; y < GRID; y++) {
-      for (let x = 0; x < GRID; x++) {
-        ctx.fillRect(x * CELL + CELL / 2 - 1, y * CELL + CELL / 2 - 1, 2, 2);
-      }
-    }
+    // prebaked static layer: background, dot grid, obstacles
+    ctx.drawImage(stat, 0, 0, CANVAS, CANVAS);
 
-    // food — pulsing disc
-    const pulse = 0.85 + 0.15 * Math.sin(t / 180);
-    ctx.fillStyle = C.food;
+    // food — pulsing disc in the zone color
+    const pulse = 0.85 + 0.15 * Math.sin(now / 180);
+    ctx.fillStyle = z.food;
     ctx.beginPath();
-    ctx.arc((food.current.x + 0.5) * CELL, (food.current.y + 0.5) * CELL, CELL * 0.26 * pulse, 0, Math.PI * 2);
+    ctx.arc(
+      (food.current.x + 0.5) * CELL,
+      (food.current.y + 0.5) * CELL,
+      CELL * 0.26 * pulse,
+      0,
+      Math.PI * 2,
+    );
     ctx.fill();
 
-    // power-up — lettered disc, blinks before expiring
+    // power-up — lettered disc in the zone accent, blinks before expiring
     if (power.current) {
       const { cell: c, type, born } = power.current;
-      const age = t - born;
-      const blink = age > POWERUP_LIFETIME - 2000 ? (Math.sin(t / 80) + 1) / 2 : 1;
+      const age = now - born;
+      const blink = age > POWERUP_LIFETIME - 2000 ? (Math.sin(now / 80) + 1) / 2 : 1;
       ctx.globalAlpha = 0.55 + 0.45 * blink;
-      ctx.fillStyle = C.snake;
+      ctx.fillStyle = z.accent;
       ctx.beginPath();
       ctx.arc((c.x + 0.5) * CELL, (c.y + 0.5) * CELL, CELL * 0.34, 0, Math.PI * 2);
       ctx.fill();
       ctx.globalAlpha = 1;
-      ctx.fillStyle = C.ink;
+      ctx.fillStyle = "#0b0b0c";
       ctx.font = `bold ${Math.floor(CELL * 0.62)}px ui-monospace, SFMono-Regular, monospace`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.fillText(POWER_LETTER[type], (c.x + 0.5) * CELL, (c.y + 0.5) * CELL + 1);
     }
 
-    // snake body — fading rounded segments
+    // snake body — selected skin, fading toward the tail
     for (let i = s.length - 1; i >= 1; i--) {
       const seg = s[i];
-      const fade = 0.28 + 0.44 * (1 - i / Math.max(1, s.length - 1));
-      ctx.globalAlpha = ghost ? fade * 0.6 : fade;
-      ctx.fillStyle = C.snake;
-      roundRect(ctx, seg.x * CELL + 2, seg.y * CELL + 2, CELL - 4, CELL - 4, 4);
+      const t = i / Math.max(1, s.length - 1);
+      let color = skin.body;
+      if (skin.rainbow) {
+        color = `hsl(${(t * 360 + (now / 12) * 360) % 360} 90% 62%)`;
+      } else if (skin.duo) {
+        color = hexLerp(skin.duo[0], skin.duo[1], t);
+      }
+      ctx.globalAlpha = (ghost ? 0.5 : 0.78) * (0.35 + 0.65 * (1 - t));
+      ctx.fillStyle = color;
+      ctx.fillRect(seg.x * CELL + 2, seg.y * CELL + 2, CELL - 4, CELL - 4);
     }
     ctx.globalAlpha = 1;
 
     // ghost-mode wrap hint: soft border glow while active
     if (ghost) {
-      ctx.strokeStyle = C.ghostTrail;
+      ctx.strokeStyle = `${z.accent}55`;
       ctx.lineWidth = 4;
       ctx.strokeRect(2, 2, CANVAS - 4, CANVAS - 4);
     }
 
     // head — always solid
-    ctx.fillStyle = C.snake;
+    ctx.fillStyle = skin.head;
     roundRect(ctx, s[0].x * CELL + 1, s[0].y * CELL + 1, CELL - 2, CELL - 2, 5);
 
     // particles
-    ctx.fillStyle = C.particle;
+    ctx.fillStyle = z.accent;
     for (const p of particles.current) {
       ctx.globalAlpha = Math.max(0, p.life / p.max);
       ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
     }
     ctx.globalAlpha = 1;
 
-    // hairline board border
-    ctx.strokeStyle = C.border;
+    // hairline board border in the zone wall color
+    ctx.strokeStyle = z.wall;
     ctx.lineWidth = 1;
     ctx.strokeRect(0.5, 0.5, CANVAS - 1, CANVAS - 1);
 
@@ -710,13 +932,19 @@ export default function SnakeGame() {
 
   /* ---------- main loop: fixed-timestep sim + per-frame render ---------- */
 
+  /* Keep stable refs to the latest step/render so the loop subscribes once. */
+  const stepRef = useRef(step);
+  const renderRef = useRef(render);
+  stepRef.current = step;
+  renderRef.current = render;
+
   useEffect(() => {
     let cancelled = false;
 
-    const loop = (now: number) => {
+    const loop = (t: number) => {
       if (cancelled) return;
-      const dt = Math.min(50, now - lastT.current);
-      lastT.current = now;
+      const dt = Math.min(50, t - lastT.current);
+      lastT.current = t;
 
       // decay visual effects regardless of phase
       if (shake.current > 0) shake.current -= 1;
@@ -730,34 +958,42 @@ export default function SnakeGame() {
       }
 
       if (phaseRef.current === "playing") {
-        const t = performance.now();
+        const now = performance.now();
 
         // schedule / expire power-ups
-        if (!power.current && t >= timers.current.nextPowerAt) {
+        if (!power.current && now >= timers.current.nextPowerAt) {
           spawnPower();
         }
-        if (power.current && t - power.current.born > POWERUP_LIFETIME) {
+        if (power.current && now - power.current.born > POWERUP_LIFETIME) {
           power.current = null;
-          timers.current.nextPowerAt = t + POWERUP_INTERVAL;
+          timers.current.nextPowerAt = now + POWERUP_INTERVAL;
         }
 
-        // fixed-timestep stepping, slowed 40% while slow-power is active
+        // fixed-timestep stepping, slowed while slow-power is active
         const base = LEVELS_SPEED_MS[Math.min(levelRef.current - 1, LEVELS_SPEED_MS.length - 1)];
-        const interval = t < timers.current.slowUntil ? base * 1.65 : base;
+        const interval = now < timers.current.slowUntil ? base * 1.65 : base;
         stepAcc.current += dt;
-        while (stepAcc.current >= interval && phaseRef.current === "playing") {
+        let guard = 0;
+        while (stepAcc.current >= interval && phaseRef.current === "playing" && guard < 4) {
           stepAcc.current -= interval;
-          step();
+          guard += 1;
+          stepRef.current();
         }
 
-        // expire timed powers (HUD countdown)
-        const gLeft = Math.max(0, Math.ceil((timers.current.ghostUntil - t) / 1000));
-        const sLeft = Math.max(0, Math.ceil((timers.current.slowUntil - t) / 1000));
-        setGhostSecs(timers.current.ghostUntil > t ? gLeft : 0);
-        setSlowSecs(timers.current.slowUntil > t ? sLeft : 0);
+        // expire timed powers (HUD countdown — only touch state on change)
+        const gLeft = timers.current.ghostUntil > now ? Math.ceil((timers.current.ghostUntil - now) / 1000) : 0;
+        const sLeft = timers.current.slowUntil > now ? Math.ceil((timers.current.slowUntil - now) / 1000) : 0;
+        if (gLeft !== lastGhostShown.current) {
+          lastGhostShown.current = gLeft;
+          setGhostSecs(gLeft);
+        }
+        if (sLeft !== lastSlowShown.current) {
+          lastSlowShown.current = sLeft;
+          setSlowSecs(sLeft);
+        }
       }
 
-      render();
+      renderRef.current();
       raf.current = requestAnimationFrame(loop);
     };
 
@@ -766,7 +1002,7 @@ export default function SnakeGame() {
       cancelled = true;
       cancelAnimationFrame(raf.current);
     };
-  }, [render, spawnPower, step]);
+  }, [spawnPower]);
 
   /* ---------- DPR-aware canvas backing store ---------- */
 
@@ -811,14 +1047,18 @@ export default function SnakeGame() {
       else if (k === "ArrowRight" || k === "d" || k === "D") queueDir("right");
       else if (k === " ") togglePause();
       else if (k === "m" || k === "M") toggleMuted();
-      else if (k === "Escape" && phaseRef.current === "playing") setPhase("paused");
-      else if (k === "Enter" || k === "r" || k === "R") {
+      else if (k === "Escape") {
+        if (showHelp) setShowHelp(false);
+        else if (showSkins) setShowSkins(false);
+        else if (showAch) setShowAch(false);
+        else if (phaseRef.current === "playing") setPhase("paused");
+      } else if (k === "Enter" || k === "r" || k === "R") {
         if (phaseRef.current !== "dying") beginGame();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [beginGame, queueDir, setPhase, toggleMuted, togglePause]);
+  }, [beginGame, queueDir, setPhase, showAch, showHelp, showSkins, toggleMuted, togglePause]);
 
   /* ---------- auto-pause when the tab is hidden ---------- */
 
@@ -865,7 +1105,8 @@ export default function SnakeGame() {
   /* ---------- derived UI ---------- */
 
   const playing = phase === "playing";
-  const speedLabel = ["Unhurried", "Brisk", "Steady+", "Quick", "Fast", "Blistering"][level - 1] ?? "";
+  const zone = ZONES[zoneIdx];
+  const speedLabel = SPEED_LABELS[level - 1] ?? "";
 
   /* ---------- render ---------- */
 
@@ -875,17 +1116,25 @@ export default function SnakeGame() {
       <header className="border-b border-border">
         <div className="mx-auto flex w-full max-w-3xl items-center justify-between px-4 py-4">
           <div className="flex items-center gap-3">
-            <BoardMark className="h-6 w-6 text-foreground" />
+            <IconButton label="Back to home" onClick={() => navigate("/")}>
+              <ArrowLeft className="h-4 w-4" />
+            </IconButton>
+            <span style={{ color: zone.accent }}>
+              <BoardMark className="h-6 w-6" />
+            </span>
             <div>
               <p className="text-sm font-semibold leading-none tracking-tight">Neon Snake</p>
               <p className="mt-1 text-[10px] uppercase tracking-[0.22em] text-muted-foreground">
-                Minimalism arcade
+                {zone.name} zone
               </p>
             </div>
           </div>
           <div className="flex items-center gap-2">
             <IconButton label="How to play" onClick={() => setShowHelp(true)}>
               <Info className="h-4 w-4" />
+            </IconButton>
+            <IconButton label="Achievements" onClick={() => setShowAch(true)}>
+              <Trophy className="h-4 w-4" />
             </IconButton>
             <IconButton label={muted ? "Unmute" : "Mute"} onClick={toggleMuted}>
               {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
@@ -912,8 +1161,8 @@ export default function SnakeGame() {
       <section className="border-b border-border">
         <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center justify-between gap-2 px-4 py-3">
           <div className="flex flex-wrap items-center gap-2">
-            <Pill label="Score" value={score} />
-            <Pill label="High" value={high} />
+            <Pill label="Score" value={score.toLocaleString()} />
+            <Pill label="High" value={high.toLocaleString()} />
             <Pill label="Level" value={`${level}/${MAX_LEVEL}`} />
             <Pill label="Lives" value={"●".repeat(lives) || "—"} />
           </div>
@@ -935,7 +1184,10 @@ export default function SnakeGame() {
       {/* ── board ──────────────────────────────────────────────── */}
       <main className="flex flex-1 flex-col items-center px-4 py-6">
         <div ref={boardWrapRef} className="w-full max-w-[462px]">
-          <div className="relative aspect-square w-full">
+          <div
+            className="relative aspect-square w-full border transition-colors duration-500"
+            style={{ borderColor: zone.wall }}
+          >
             <canvas
               ref={canvasRef}
               className="absolute inset-0 h-full w-full touch-none select-none"
@@ -943,18 +1195,66 @@ export default function SnakeGame() {
               role="img"
             />
 
+            {/* zone-change banner */}
+            <AnimatePresence>
+              {zoneBanner && (
+                <motion.div
+                  key="zone"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -6 }}
+                  transition={{ duration: 0.3 }}
+                  className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center"
+                >
+                  <div className="text-center">
+                    <p
+                      className="text-[10px] uppercase tracking-[0.3em]"
+                      style={{ color: zone.accent }}
+                    >
+                      Zone {zoneIdx + 1} of {ZONES.length}
+                    </p>
+                    <p className="mt-2 text-2xl font-semibold tracking-tight">{zoneBanner}</p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* achievement toast */}
+            <AnimatePresence>
+              {achToast && (
+                <motion.div
+                  key={achToast.id}
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8 }}
+                  transition={{ duration: 0.25 }}
+                  className="absolute left-1/2 top-3 z-20 -translate-x-1/2 border border-border bg-background/95 px-4 py-2.5 shadow-sm"
+                >
+                  <p className="flex items-center gap-2 text-[10px] uppercase tracking-[0.22em] text-muted-foreground">
+                    <Trophy className="h-3.5 w-3.5" style={{ color: zone.accent }} />
+                    Achievement
+                  </p>
+                  <p className="mt-1 text-sm font-semibold">{achToast.name}</p>
+                  <p className="text-[11px] text-muted-foreground">{achToast.desc}</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
             <AnimatePresence>
               {/* start */}
-              {phase === "start" && !showHelp && (
+              {phase === "start" && !showHelp && !showSkins && !showAch && (
                 <Overlay label="Start screen">
                   <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">Ready</p>
                   <h1 className="mt-3 text-3xl font-semibold tracking-tight">Neon Snake</h1>
                   <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-                    Eat. Grow. Clear six levels. Grab power-ups — but don&apos;t touch the walls,
-                    or yourself.
+                    Eat. Grow. Clear {MAX_LEVEL} levels across {ZONES.length} color zones. Grab
+                    power-ups, dodge obstacles — and don&apos;t touch the walls, or yourself.
                   </p>
                   <div className="mt-6 space-y-2">
                     <OverlayButton onClick={beginGame}>Start game</OverlayButton>
+                    <OverlayButton variant="ghost" onClick={() => setShowSkins(true)}>
+                      Snake colors
+                    </OverlayButton>
                     <OverlayButton variant="ghost" onClick={() => setShowHelp(true)}>
                       How to play
                     </OverlayButton>
@@ -963,15 +1263,18 @@ export default function SnakeGame() {
               )}
 
               {/* paused */}
-              {phase === "paused" && !showHelp && (
+              {phase === "paused" && !showHelp && !showSkins && !showAch && (
                 <Overlay label="Paused">
                   <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">Paused</p>
                   <h2 className="mt-3 text-2xl font-semibold tracking-tight">Take a breath</h2>
                   <p className="mt-2 text-sm text-muted-foreground">
-                    Score {score} · Level {level}
+                    Score {score.toLocaleString()} · Level {level}
                   </p>
                   <div className="mt-6 space-y-2">
                     <OverlayButton onClick={togglePause}>Resume</OverlayButton>
+                    <OverlayButton variant="ghost" onClick={() => setShowSkins(true)}>
+                      Snake colors
+                    </OverlayButton>
                     <OverlayButton variant="ghost" onClick={beginGame}>
                       Restart
                     </OverlayButton>
@@ -980,7 +1283,7 @@ export default function SnakeGame() {
               )}
 
               {/* game over */}
-              {phase === "over" && !showHelp && (
+              {phase === "over" && !showHelp && !showSkins && !showAch && (
                 <Overlay label="Game over">
                   <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
                     Game over
@@ -988,31 +1291,36 @@ export default function SnakeGame() {
                   <h2 className="mt-3 text-2xl font-semibold tracking-tight">Out of lives</h2>
                   <dl className="mx-auto mt-5 grid w-44 grid-cols-2 gap-y-2 text-sm">
                     <dt className="text-left text-muted-foreground">Score</dt>
-                    <dd className="text-right font-mono tabular-nums">{score}</dd>
+                    <dd className="text-right font-mono tabular-nums">{score.toLocaleString()}</dd>
                     <dt className="text-left text-muted-foreground">Level</dt>
                     <dd className="text-right font-mono tabular-nums">{level}</dd>
                     <dt className="text-left text-muted-foreground">High</dt>
-                    <dd className="text-right font-mono tabular-nums">{high}</dd>
+                    <dd className="text-right font-mono tabular-nums">{high.toLocaleString()}</dd>
                   </dl>
                   <div className="mt-6 space-y-2">
                     <OverlayButton onClick={beginGame}>Play again</OverlayButton>
+                    <OverlayButton variant="ghost" onClick={() => setShowAch(true)}>
+                      Achievements
+                    </OverlayButton>
                   </div>
                 </Overlay>
               )}
 
               {/* win */}
-              {phase === "won" && !showHelp && (
+              {phase === "won" && !showHelp && !showSkins && !showAch && (
                 <Overlay label="You win">
                   <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
                     Cleared
                   </p>
-                  <h2 className="mt-3 text-2xl font-semibold tracking-tight">All six levels</h2>
-                  <p className="mt-2 text-sm text-muted-foreground">Flawless run of the grid.</p>
+                  <h2 className="mt-3 text-2xl font-semibold tracking-tight">All {MAX_LEVEL} levels</h2>
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    Flawless run through every zone.
+                  </p>
                   <dl className="mx-auto mt-5 grid w-44 grid-cols-2 gap-y-2 text-sm">
                     <dt className="text-left text-muted-foreground">Score</dt>
-                    <dd className="text-right font-mono tabular-nums">{score}</dd>
+                    <dd className="text-right font-mono tabular-nums">{score.toLocaleString()}</dd>
                     <dt className="text-left text-muted-foreground">High</dt>
-                    <dd className="text-right font-mono tabular-nums">{high}</dd>
+                    <dd className="text-right font-mono tabular-nums">{high.toLocaleString()}</dd>
                   </dl>
                   <div className="mt-6 space-y-2">
                     <OverlayButton onClick={beginGame}>Play again</OverlayButton>
@@ -1022,7 +1330,7 @@ export default function SnakeGame() {
 
               {/* instructions / help */}
               {showHelp && (
-                <Overlay label="How to play">
+                <Overlay label="How to play" wide>
                   <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
                     How to play
                   </p>
@@ -1037,22 +1345,101 @@ export default function SnakeGame() {
                     </li>
                     <li>
                       <span className="text-foreground">Goal</span> — eat {FOODS_PER_LEVEL} discs to
-                      clear each of {MAX_LEVEL} levels. Speed rises every level.
+                      clear each of {MAX_LEVEL} levels. Speed rises every level; obstacles appear
+                      from level 3.
                     </li>
                     <li>
-                      <span className="text-foreground">Lose</span> — hit a wall or your own body;
-                      three lives total. Ghost power wraps through walls and body.
+                      <span className="text-foreground">Zones</span> — every {3} levels the board
+                      recolors: {ZONES.map((z) => z.name).join(" → ")}.
+                    </li>
+                    <li>
+                      <span className="text-foreground">Lose</span> — hit a wall, an obstacle, or
+                      your own body; three lives total.
                     </li>
                     <li>
                       <span className="text-foreground">Power-ups</span> —{" "}
                       <span className="font-mono text-foreground">+</span> bonus points,{" "}
                       <span className="font-mono text-foreground">S</span> slow motion,{" "}
-                      <span className="font-mono text-foreground">G</span> ghost,{" "}
+                      <span className="font-mono text-foreground">G</span> ghost (wrap through
+                      everything),{" "}
                       <span className="font-mono text-foreground">−</span> shrink your tail.
+                    </li>
+                    <li>
+                      <span className="text-foreground">Colors</span> — snake skins unlock as you
+                      score, level up, and win achievements.
                     </li>
                   </ul>
                   <div className="mt-6">
                     <OverlayButton onClick={() => setShowHelp(false)}>Back</OverlayButton>
+                  </div>
+                </Overlay>
+              )}
+
+              {/* skin picker */}
+              {showSkins && (
+                <Overlay label="Snake colors" wide>
+                  <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
+                    Snake colors
+                  </p>
+                  <h2 className="mt-3 text-2xl font-semibold tracking-tight">Pick your neon</h2>
+                  <div className="mt-5 grid grid-cols-5 gap-2.5">
+                    {SKINS.map((s) => {
+                      const u = isSkinUnlockedStable(s);
+                      const selected = skinId === s.id;
+                      return (
+                        <button
+                          key={s.id}
+                          onClick={() => pickSkin(s)}
+                          title={u.ok ? s.name : unlockText(s.unlock)}
+                          aria-label={u.ok ? s.name : `Locked: ${unlockText(s.unlock)}`}
+                          aria-pressed={selected}
+                          className={`relative flex h-11 w-full items-center justify-center border transition-opacity ${
+                            selected ? "border-foreground" : "border-border"
+                          } ${u.ok ? "hover:opacity-80" : "opacity-30"}`}
+                          style={{ background: cssForSkin(s) }}
+                        >
+                          {!u.ok && <Lock className="h-3.5 w-3.5 text-background mix-blend-difference" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="mt-3 min-h-8 text-[11px] leading-relaxed text-muted-foreground">
+                    {skinHint ??
+                      `${unlockedSkinCount} of ${SKINS.length} unlocked · gradients and rainbow skins are achievements`}
+                  </p>
+                  <div className="mt-3">
+                    <OverlayButton onClick={() => setShowSkins(false)}>Back</OverlayButton>
+                  </div>
+                </Overlay>
+              )}
+
+              {/* achievements list */}
+              {showAch && (
+                <Overlay label="Achievements" wide>
+                  <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
+                    Achievements
+                  </p>
+                  <h2 className="mt-3 text-2xl font-semibold tracking-tight">
+                    {unlocked.length} / {ACHIEVEMENTS.length}
+                  </h2>
+                  <ul className="mt-4 max-h-56 space-y-2 overflow-y-auto pr-1 text-left">
+                    {ACHIEVEMENTS.map((a) => {
+                      const got = achRef.current.has(a.id);
+                      return (
+                        <li
+                          key={a.id}
+                          className={`border px-3 py-2 ${got ? "border-border" : "border-border/50 opacity-50"}`}
+                        >
+                          <p className="text-xs font-semibold">
+                            {got ? a.name : "· · ·"}
+                          </p>
+                          <p className="text-[11px] text-muted-foreground">{a.desc}</p>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  <div className="mt-4">
+                    <OverlayButton onClick={() => setShowAch(false)}>Back</OverlayButton>
                   </div>
                 </Overlay>
               )}
@@ -1066,9 +1453,9 @@ export default function SnakeGame() {
             />
           </div>
 
-          {/* level / speed caption */}
+          {/* level / speed / zone caption */}
           <p className="mt-3 text-center text-[10px] uppercase tracking-[0.25em] text-muted-foreground">
-            Level {level} · {speedLabel}
+            Level {level} · {speedLabel} · <span style={{ color: zone.accent }}>{zone.name}</span>
           </p>
 
           {/* touch d-pad (small screens) */}
@@ -1118,7 +1505,9 @@ export default function SnakeGame() {
             <Kbd>M</Kbd>
             <span>mute</span>
           </div>
-          <span>{MAX_LEVEL} levels · 3 lives · power-ups every ~9s</span>
+          <span>
+            {MAX_LEVEL} levels · {ZONES.length} zones · 3 lives · {SKINS.length} skins
+          </span>
         </div>
       </footer>
     </div>

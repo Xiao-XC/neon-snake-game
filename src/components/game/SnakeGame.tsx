@@ -34,7 +34,6 @@ import {
   Trophy,
   Volume2,
   VolumeX,
-  X,
 } from "lucide-react";
 import {
   ACHIEVEMENTS,
@@ -56,7 +55,7 @@ import {
   POWERUP_INTERVAL,
   POWERUP_LIFETIME,
   POWER_LETTER,
-  qualifiesForLeaderboard,
+  clearLeaderboard,
   recordScore,
   RESPAWN_MS,
   RISK_DISC_CHANCE,
@@ -452,12 +451,12 @@ export default function SnakeGame() {
   const [score, setScore] = useState(0);
   const [lives, setLives] = useState(START_LIVES);
   const [level, setLevel] = useState(1);
-  const [high, setBest] = useState(() => Number(lsGet(LS.high) ?? 0));
   const [board, setBoard] = useState<ScoreEntry[]>(() => loadLeaderboard());
+  const [high, setHigh] = useState(() => loadLeaderboard()[0]?.score ?? Number(lsGet(LS.high) ?? 0));
   const [newRank, setNewRank] = useState<number | null>(null); // rank of the just-finished run
   const [showBoard, setShowBoard] = useState(false);
-  const [confirmClear, setConfirmClear] = useState(false); // leaderboard reset confirmation
   const [nearMiss, setNearMiss] = useState(false); // drives the edge-glow overlay
+  const [confirmClear, setConfirmClear] = useState(false);
   const [bestLevel, setBestLevel] = useState(() => Number(lsGet(LS.bestLevel) ?? 1));
   const [muted, setMuted] = useState(() => lsGet(LS.muted) === "1");
   const [reducedFx, setReducedFx] = useState(() => lsGet(LS.fx) === "1");
@@ -537,47 +536,24 @@ export default function SnakeGame() {
 
   /* ---------- score + skins ---------- */
 
-  /**
-   * Add points. The top-5 leaderboard updates live (rank 1 = in-progress
-   * best) so the HUD "Best" pill always shows the true best entry; the
-   * finished run is committed to storage at game over / win.
-   */
+  /** Add points and keep the legacy best-score display live-updated. */
   const addScore = useCallback(
     (n: number) => {
       scoreRef.current += n;
       setScore(scoreRef.current);
       if (scoreRef.current >= 500) unlock("score-500");
       if (scoreRef.current >= 1500) unlock("score-1500");
-      setBoard((b) => {
-        if (!qualifiesForLeaderboard(b, scoreRef.current)) return b;
-        if (rankRef.current === null) {
-          // this run first beats an entry — slot it in, remembered until commit
-          const copy = [...b, { score: scoreRef.current, level: 1, date: "" }];
-          copy.sort((x, y) => y.score - x.score);
-          rankRef.current = Math.min(5, copy.findIndex((e) => e.score === scoreRef.current) + 1);
-          setNewRank(rankRef.current);
-          return copy.slice(0, 5);
-        }
-        // this run already on the board — keep its slot current
-        const updated = [...b];
-        updated[rankRef.current - 1] = { score: scoreRef.current, level: 1, date: "" };
-        updated.sort((x, y) => y.score - x.score);
-        rankRef.current = Math.min(5, updated.findIndex((e) => e.score === scoreRef.current) + 1);
-        return updated;
-      });
+      setHigh((current) => Math.max(current, scoreRef.current));
     },
     [unlock],
   );
 
   /* ---------- leaderboard + near-miss ---------- */
 
-  // Legacy single-value key stays in sync with the top entry (HUD pill, skin hints).
+  // Keep score-based skin unlocks aligned with the current top leaderboard entry.
   useEffect(() => {
     const top = board[0]?.score ?? 0;
-    if (top > 0 && top !== high) {
-      setBest(top);
-      lsSet(LS.high, String(top));
-    }
+    if (top > high) setHigh(top);
   }, [board, high]);
 
   // leaving "playing" — pause, death, win — resets transient run state
@@ -594,27 +570,43 @@ export default function SnakeGame() {
    * (wall / obstacle / own body) and survived. Genuine close calls only.
    */
   const registerNearMiss = useCallback((now: number) => {
+    // Reduced motion suppresses the flash, not the gameplay audio cue.
     if (!fxRef.current) {
       nearMissUntil.current = now + 380; // edge glow fades over ~380ms
       setNearMiss(true);
-      sfx.current?.nearMiss();
     }
+    sfx.current?.nearMiss();
   }, []);
 
   /** Commit the finished run into the top 5; remember its final rank. */
   const commitScore = useCallback(
     (lvl: number) => {
-      const { list, rank } = recordScore(
-        board.filter((e) => e.date !== ""), // drop the provisional in-progress entry
-        scoreRef.current,
-        lvl,
-      );
-      setBoard(list);
-      setNewRank(rank);
-      rankRef.current = rank; // finished run committed — clear the provisional slot
+      const { list, rank } = recordScore(board, scoreRef.current, lvl);
+      if (rank !== null) {
+        setBoard(list);
+        setNewRank(rank);
+      }
+      setHigh((best) => {
+        const next = Math.max(best, scoreRef.current);
+        lsSet(LS.high, String(next));
+        return next;
+      });
     },
     [board],
   );
+
+  const leaderboardReturnPhase = useRef<Phase>("start");
+  const openLeaderboard = useCallback(() => {
+    leaderboardReturnPhase.current = phaseRef.current;
+    if (phaseRef.current === "playing") setPhase("paused");
+    setShowBoard(true);
+  }, [setPhase]);
+  const closeLeaderboard = useCallback(() => {
+    setShowBoard(false);
+    const previous = leaderboardReturnPhase.current;
+    if (previous === "playing") setPhase("playing");
+    else if (previous === "start" || previous === "over" || previous === "won") setPhase(previous);
+  }, [setPhase]);
 
   function isSkinUnlocked(s: Skin): { ok: boolean; hint: string } {
     const u = s.unlock;
@@ -832,7 +824,7 @@ export default function SnakeGame() {
 
   const beginGame = useCallback(() => {
     resetRun();
-    rankRef.current = null; // a fresh run discards the previous run's highlight
+    rankRef.current = null;
     setNewRank(null);
     setPhase("playing");
   }, [resetRun, setPhase]);
@@ -1304,11 +1296,11 @@ export default function SnakeGame() {
       else if (k === " ") togglePause();
       else if (k === "m" || k === "M") toggleMuted();
       else if (k === "Escape") {
-        if (showBoard) setShowBoard(false);
+        if (showBoard && confirmClear) setConfirmClear(false);
+        else if (showBoard) setShowBoard(false);
         else if (showHelp) setShowHelp(false);
         else if (showSkins) setShowSkins(false);
         else if (showAch) setShowAch(false);
-        else if (confirmClear) setConfirmClear(false);
         else if (phaseRef.current === "playing") setPhase("paused");
       } else if (k === "Enter" || k === "r" || k === "R") {
         if (phaseRef.current !== "dying") beginGame();
@@ -1316,7 +1308,7 @@ export default function SnakeGame() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [beginGame, queueDir, setPhase, showAch, showBoard, showHelp, showSkins, toggleMuted, togglePause]);
+  }, [beginGame, confirmClear, queueDir, setPhase, showAch, showBoard, showHelp, showSkins, toggleMuted, togglePause]);
 
   /* ---------- auto-pause when the tab is hidden ---------- */
 
@@ -1394,7 +1386,7 @@ export default function SnakeGame() {
             <IconButton label="Achievements" onClick={() => setShowAch(true)}>
               <Trophy className="h-4 w-4" />
             </IconButton>
-            <IconButton label="Leaderboard" onClick={() => setShowBoard(true)}>
+            <IconButton label="Leaderboard" onClick={openLeaderboard}>
               <Medal className="h-4 w-4" />
             </IconButton>
             <IconButton label={muted ? "Unmute" : "Mute"} onClick={toggleMuted}>
@@ -1478,6 +1470,37 @@ export default function SnakeGame() {
               aria-label="Snake game board"
               role="img"
             />
+            {showBoard && (
+              <Overlay label="Leaderboard" wide>
+                <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">Leaderboard</p>
+                <h2 className="mt-3 text-2xl font-semibold tracking-tight">Top 5 runs</h2>
+                {confirmClear ? (
+                  <div className="mt-5">
+                    <p className="text-sm text-muted-foreground">Clear the leaderboard? This can&apos;t be undone.</p>
+                    <div className="mt-4 flex gap-2">
+                      <button onClick={() => { clearLeaderboard(); setBoard([]); setHigh(0); setNewRank(null); setConfirmClear(false); }} className="flex-1 bg-foreground px-4 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] text-background">Clear</button>
+                      <button onClick={() => setConfirmClear(false)} className="flex-1 border border-border px-4 py-2.5 text-xs font-semibold uppercase tracking-[0.2em]">Keep</button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <ol className="mt-4 max-h-56 space-y-2 overflow-y-auto text-left">
+                      {board.length === 0 && <li className="border border-border/50 px-3 py-3 text-center text-xs text-muted-foreground">No runs yet — finish a game to set the first record.</li>}
+                      {board.map((entry, i) => (
+                        <li key={`${entry.date}-${i}`} className={`flex items-center justify-between border px-3 py-2 ${newRank === i + 1 ? "border-foreground" : "border-border"}`}>
+                          <span className="flex items-baseline gap-3"><span className="font-mono text-[10px] text-muted-foreground">#{i + 1}</span><span className="font-mono text-sm tabular-nums">{entry.score.toLocaleString()}</span>{newRank === i + 1 && <span className="text-[10px] uppercase tracking-[0.2em]" style={{ color: zone.accent }}>This run! New #{newRank} best!</span>}</span>
+                          <span className="text-[11px] text-muted-foreground">lvl {entry.level} · {new Date(entry.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span>
+                        </li>
+                      ))}
+                    </ol>
+                    <div className="mt-4 space-y-2">
+                      <OverlayButton onClick={closeLeaderboard}>Back</OverlayButton>
+                      {board.length > 0 && <button onClick={() => setConfirmClear(true)} className="w-full px-4 py-2 text-[10px] uppercase tracking-[0.2em] text-muted-foreground hover:bg-accent">Clear leaderboard</button>}
+                    </div>
+                  </>
+                )}
+              </Overlay>
+            )}
 
             {/* zone-change banner */}
             <AnimatePresence>
@@ -1526,7 +1549,7 @@ export default function SnakeGame() {
 
             <AnimatePresence>
               {/* start */}
-              {phase === "start" && !showHelp && !showSkins && !showAch && (
+              {phase === "start" && !showBoard && !showHelp && !showSkins && !showAch && (
                 <Overlay label="Start screen">
                   <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">Ready</p>
                   <h1 className="mt-3 text-3xl font-semibold tracking-tight">Neon Snake</h1>
@@ -1536,7 +1559,7 @@ export default function SnakeGame() {
                   </p>
                   <div className="mt-6 space-y-2">
                     <OverlayButton onClick={beginGame}>Start game</OverlayButton>
-                    <OverlayButton variant="ghost" onClick={() => setShowBoard(true)}>
+                    <OverlayButton variant="ghost" onClick={openLeaderboard}>
                       Leaderboard
                     </OverlayButton>
                     <OverlayButton variant="ghost" onClick={() => setShowSkins(true)}>
@@ -1550,7 +1573,7 @@ export default function SnakeGame() {
               )}
 
               {/* paused */}
-              {phase === "paused" && !showHelp && !showSkins && !showAch && (
+              {phase === "paused" && !showBoard && !showHelp && !showSkins && !showAch && (
                 <Overlay label="Paused">
                   <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">Paused</p>
                   <h2 className="mt-3 text-2xl font-semibold tracking-tight">Take a breath</h2>

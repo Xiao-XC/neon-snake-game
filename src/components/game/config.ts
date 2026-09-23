@@ -353,18 +353,21 @@ export function loadLeaderboard(): ScoreEntry[] {
         }))
     : [];
 
-  // legacy migration: a lone high score becomes the founding entry
-  if (entries.length === 0) {
-    let legacy = NaN;
-    try {
-      legacy = Number(localStorage.getItem("neon-snake:high"));
-    } catch {
-      /* no legacy value */
-    }
-    if (Number.isFinite(legacy) && legacy > 0) {
-      entries = [{ score: legacy, level: 1, date: new Date().toISOString() }];
-      saveLeaderboard(entries);
-    }
+  // Migrate the old single score even if a new-format list already exists.
+  // We only know the historic best level, so use the saved best-level value.
+  let legacy = NaN;
+  let legacyLevel = 1;
+  try {
+    legacy = Number(localStorage.getItem("neon-snake:high"));
+    legacyLevel = Math.max(1, Number(localStorage.getItem("neon-snake:best-level")) || 1);
+  } catch {
+    /* no legacy value */
+  }
+  if (Number.isFinite(legacy) && legacy > 0 && !entries.some((e) => e.score === legacy)) {
+    entries.push({ score: legacy, level: legacyLevel, date: new Date().toISOString() });
+    entries.sort((a, b) => b.score - a.score);
+    entries = entries.slice(0, 5);
+    saveLeaderboard(entries);
   }
 
   return entries.sort((a, b) => b.score - a.score).slice(0, 5);
@@ -379,6 +382,16 @@ export function saveLeaderboard(entries: ScoreEntry[]): void {
   }
 }
 
+/** Clear both the current board and the migrated legacy high-score value. */
+export function clearLeaderboard(): void {
+  saveLeaderboard([]);
+  try {
+    localStorage.removeItem("neon-snake:high");
+  } catch {
+    /* storage unavailable */
+  }
+}
+
 /** Insert a finished run into the top 5; returns the new list + its rank (null when it didn't qualify). */
 export function recordScore(
   entries: ScoreEntry[],
@@ -386,11 +399,10 @@ export function recordScore(
   level: number,
 ): { list: ScoreEntry[]; rank: number | null } {
   if (!qualifiesForLeaderboard(entries, score)) return { list: entries, rank: null };
-  const list = [...entries, { score, level, date: new Date().toISOString() }]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 5);
+  const entry: ScoreEntry = { score, level, date: new Date().toISOString() };
+  const list = [...entries, entry].sort((a, b) => b.score - a.score).slice(0, 5);
   saveLeaderboard(list);
-  return { list, rank: list.findIndex((e) => e.score === score) + 1 };
+  return { list, rank: list.indexOf(entry) + 1 };
 }
 
 /* ------------------------------------------------------------------ */

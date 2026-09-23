@@ -313,6 +313,87 @@ export function buildObstacles(level: number): Pt[] {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Local leaderboard — anonymous top 5, stored on-device              */
+/* ------------------------------------------------------------------ */
+
+export type ScoreEntry = { score: number; level: number; date: string };
+
+/** Score needed to beat the entry at rank `i` (0-based) in a top-5 list. */
+export function qualifiesForLeaderboard(entries: ScoreEntry[], score: number): boolean {
+  return score > 0 && (entries.length < 5 || score > entries[entries.length - 1].score);
+}
+
+/**
+ * Load the top-5 leaderboard. Backward compatible: migrates a legacy single
+ * high score (`neon-snake:high`) into entry #1 on first load. Sorted best
+ * first, capped at 5. Date strings are normalized to ISO format so entries
+ * written by older versions of the key still render.
+ */
+export function loadLeaderboard(): ScoreEntry[] {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(localStorage.getItem("neon-snake:leaderboard") ?? "null");
+  } catch {
+    raw = null;
+  }
+  let entries: ScoreEntry[] = Array.isArray(raw)
+    ? raw
+        .filter(
+          (e): e is ScoreEntry =>
+            typeof e === "object" &&
+            e !== null &&
+            typeof (e as ScoreEntry).score === "number" &&
+            Number.isFinite((e as ScoreEntry).score) &&
+            typeof (e as ScoreEntry).level === "number",
+        )
+        .map((e) => ({
+          score: e.score,
+          level: e.level,
+          date: typeof e.date === "string" && !Number.isNaN(Date.parse(e.date)) ? e.date : new Date(0).toISOString(),
+        }))
+    : [];
+
+  // legacy migration: a lone high score becomes the founding entry
+  if (entries.length === 0) {
+    let legacy = NaN;
+    try {
+      legacy = Number(localStorage.getItem("neon-snake:high"));
+    } catch {
+      /* no legacy value */
+    }
+    if (Number.isFinite(legacy) && legacy > 0) {
+      entries = [{ score: legacy, level: 1, date: new Date().toISOString() }];
+      saveLeaderboard(entries);
+    }
+  }
+
+  return entries.sort((a, b) => b.score - a.score).slice(0, 5);
+}
+
+/** Persist the leaderboard; silently no-ops when storage is unavailable. */
+export function saveLeaderboard(entries: ScoreEntry[]): void {
+  try {
+    localStorage.setItem("neon-snake:leaderboard", JSON.stringify(entries));
+  } catch {
+    /* private mode — non-fatal */
+  }
+}
+
+/** Insert a finished run into the top 5; returns the new list + its rank (null when it didn't qualify). */
+export function recordScore(
+  entries: ScoreEntry[],
+  score: number,
+  level: number,
+): { list: ScoreEntry[]; rank: number | null } {
+  if (!qualifiesForLeaderboard(entries, score)) return { list: entries, rank: null };
+  const list = [...entries, { score, level, date: new Date().toISOString() }]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+  saveLeaderboard(list);
+  return { list, rank: list.findIndex((e) => e.score === score) + 1 };
+}
+
+/* ------------------------------------------------------------------ */
 /*  Color helpers                                                      */
 /* ------------------------------------------------------------------ */
 

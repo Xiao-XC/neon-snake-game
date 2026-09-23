@@ -1,5 +1,6 @@
 /**
- * Neon Snake — a minimalist arcade snake game.
+ * Neon Snake — minimalist arcade game. Anonymous top-5 local leaderboard,
+ * near-miss feedback, combo scoring, risk/reward discs.
  *
  * Rendering: HTML5 <canvas>, fixed 21×21 logical grid, DPR-aware backing
  * store, requestAnimationFrame loop with a fixed-timestep simulation.
@@ -26,12 +27,14 @@ import {
   ArrowUp,
   Info,
   Lock,
+  Medal,
   Pause,
   Play,
   RotateCcw,
   Trophy,
   Volume2,
   VolumeX,
+  X,
 } from "lucide-react";
 import {
   ACHIEVEMENTS,
@@ -44,6 +47,7 @@ import {
   GHOST_MS,
   GRID,
   LEVELS_SPEED_MS,
+  loadLeaderboard,
   MAX_LEVEL,
   MAX_PARTICLES,
   OPPOSITE,
@@ -52,6 +56,8 @@ import {
   POWERUP_INTERVAL,
   POWERUP_LIFETIME,
   POWER_LETTER,
+  qualifiesForLeaderboard,
+  recordScore,
   RESPAWN_MS,
   RISK_DISC_CHANCE,
   RISK_FOOD_COLOR,
@@ -73,6 +79,7 @@ import {
   type Phase,
   type PowerType,
   type Pt,
+  type ScoreEntry,
   type Skin,
 } from "./config";
 
@@ -242,6 +249,11 @@ class Sfx {
     this.beep(740, 0.07, "square", 0.09);
     this.beep(1108, 0.07, "square", 0.09, 0.06);
     this.beep(1480, 0.14, "triangle", 0.1, 0.12);
+  }
+  /** Short "phew" — a tight rising fifth with a bright top note. */
+  nearMiss() {
+    this.beep(330, 0.06, "sine", 0.09);
+    this.beep(494, 0.1, "sine", 0.08, 0.05);
   }
   power() {
     this.beep(523, 0.08, "triangle", 0.1);
@@ -431,13 +443,21 @@ export default function SnakeGame() {
   const lastGhostShown = useRef(0);
   const lastSlowShown = useRef(0);
   const achRef = useRef<Set<string>>(new Set(lsGetJSON<string[]>(LS.ach, [])));
+  const rankRef = useRef<number | null>(null); // slot of the in-progress run on the board
+  const nearMissUntil = useRef(0); // wall-clock ms until the edge glow fades
+  const lastNearMiss = useRef(0); // cooldown gate against double-triggering
 
   /* ---------- reactive state (only what the HUD/overlays show) ---------- */
   const [phase, setPhaseState] = useState<Phase>("start");
   const [score, setScore] = useState(0);
   const [lives, setLives] = useState(START_LIVES);
   const [level, setLevel] = useState(1);
-  const [high, setHigh] = useState(() => Number(lsGet(LS.high) ?? 0));
+  const [high, setBest] = useState(() => Number(lsGet(LS.high) ?? 0));
+  const [board, setBoard] = useState<ScoreEntry[]>(() => loadLeaderboard());
+  const [newRank, setNewRank] = useState<number | null>(null); // rank of the just-finished run
+  const [showBoard, setShowBoard] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false); // leaderboard reset confirmation
+  const [nearMiss, setNearMiss] = useState(false); // drives the edge-glow overlay
   const [bestLevel, setBestLevel] = useState(() => Number(lsGet(LS.bestLevel) ?? 1));
   const [muted, setMuted] = useState(() => lsGet(LS.muted) === "1");
   const [reducedFx, setReducedFx] = useState(() => lsGet(LS.fx) === "1");
@@ -517,22 +537,83 @@ export default function SnakeGame() {
 
   /* ---------- score + skins ---------- */
 
-  /** Add points; keep the high score live-updated and persisted. */
+  /**
+   * Add points. The top-5 leaderboard updates live (rank 1 = in-progress
+   * best) so the HUD "Best" pill always shows the true best entry; the
+   * finished run is committed to storage at game over / win.
+   */
   const addScore = useCallback(
     (n: number) => {
       scoreRef.current += n;
       setScore(scoreRef.current);
       if (scoreRef.current >= 500) unlock("score-500");
       if (scoreRef.current >= 1500) unlock("score-1500");
-      setHigh((h) => {
-        if (scoreRef.current > h) {
-          lsSet(LS.high, String(scoreRef.current));
-          return scoreRef.current;
+      setBoard((b) => {
+        if (!qualifiesForLeaderboard(b, scoreRef.current)) return b;
+        if (rankRef.current === null) {
+          // this run first beats an entry — slot it in, remembered until commit
+          const copy = [...b, { score: scoreRef.current, level: 1, date: "" }];
+          copy.sort((x, y) => y.score - x.score);
+          rankRef.current = Math.min(5, copy.findIndex((e) => e.score === scoreRef.current) + 1);
+          setNewRank(rankRef.current);
+          return copy.slice(0, 5);
         }
-        return h;
+        // this run already on the board — keep its slot current
+        const updated = [...b];
+        updated[rankRef.current - 1] = { score: scoreRef.current, level: 1, date: "" };
+        updated.sort((x, y) => y.score - x.score);
+        rankRef.current = Math.min(5, updated.findIndex((e) => e.score === scoreRef.current) + 1);
+        return updated;
       });
     },
     [unlock],
+  );
+
+  /* ---------- leaderboard + near-miss ---------- */
+
+  // Legacy single-value key stays in sync with the top entry (HUD pill, skin hints).
+  useEffect(() => {
+    const top = board[0]?.score ?? 0;
+    if (top > 0 && top !== high) {
+      setBest(top);
+      lsSet(LS.high, String(top));
+    }
+  }, [board, high]);
+
+  // leaving "playing" — pause, death, win — resets transient run state
+  useEffect(() => {
+    if (phase !== "playing") {
+      nearMissUntil.current = 0;
+      lastNearMiss.current = 0;
+      setNearMiss(false);
+    }
+  }, [phase]);
+
+  /**
+   * Near-miss: the head ended the previous step one cell from a hazard
+   * (wall / obstacle / own body) and survived. Genuine close calls only.
+   */
+  const registerNearMiss = useCallback((now: number) => {
+    if (!fxRef.current) {
+      nearMissUntil.current = now + 380; // edge glow fades over ~380ms
+      setNearMiss(true);
+      sfx.current?.nearMiss();
+    }
+  }, []);
+
+  /** Commit the finished run into the top 5; remember its final rank. */
+  const commitScore = useCallback(
+    (lvl: number) => {
+      const { list, rank } = recordScore(
+        board.filter((e) => e.date !== ""), // drop the provisional in-progress entry
+        scoreRef.current,
+        lvl,
+      );
+      setBoard(list);
+      setNewRank(rank);
+      rankRef.current = rank; // finished run committed — clear the provisional slot
+    },
+    [board],
   );
 
   function isSkinUnlocked(s: Skin): { ok: boolean; hint: string } {
@@ -742,12 +823,17 @@ export default function SnakeGame() {
     comboRef.current = 0;
     comboExpireRef.current = 0;
     setCombo(null);
+    nearMissUntil.current = 0;
+    lastNearMiss.current = 0;
+    setNearMiss(false);
     bakeStatic();
     spawnFood();
   }, [bakeStatic, spawnFood]);
 
   const beginGame = useCallback(() => {
     resetRun();
+    rankRef.current = null; // a fresh run discards the previous run's highlight
+    setNewRank(null);
     setPhase("playing");
   }, [resetRun, setPhase]);
 
@@ -767,6 +853,9 @@ export default function SnakeGame() {
     setGhostSecs(0);
     setSlowSecs(0);
     stepAcc.current = 0;
+    nearMissUntil.current = 0;
+    lastNearMiss.current = 0;
+    setNearMiss(false);
     bakeStatic();
     spawnFood();
     setPhase("playing");
@@ -789,20 +878,22 @@ export default function SnakeGame() {
       livesRef.current -= 1;
       setLives(livesRef.current);
       if (livesRef.current <= 0) {
+        commitScore(levelRef.current);
         setPhase("over");
       } else {
         respawn();
       }
     }, RESPAWN_MS);
-  }, [burst, respawn, setPhase]);
+  }, [burst, commitScore, respawn, setPhase]);
 
   const winGame = useCallback(() => {
     setPhase("won");
     comboRef.current = 0;
     setCombo(null);
+    commitScore(MAX_LEVEL);
     unlock("champion");
     sfx.current?.win();
-  }, [setPhase, unlock]);
+  }, [commitScore, setPhase, unlock]);
 
   /* ---------- level progression ---------- */
 
@@ -847,6 +938,7 @@ export default function SnakeGame() {
 
   const step = useCallback(() => {
     const s = snake.current;
+    const prevDir = dir.current; // heading before consuming the buffered turns
 
     // consume one buffered direction (blocks 180° reversals)
     while (queued.current.length > 0) {
@@ -861,6 +953,37 @@ export default function SnakeGame() {
     let hx = s[0].x + v.x;
     let hy = s[0].y + v.y;
     const ghost = performance.now() < timers.current.ghostUntil;
+
+    // Near-miss detection — genuine close calls only. (1) Turn saves: the
+    // heading just changed and the OLD heading pointed one cell ahead into a
+    // wall/obstacle/body — the turn is what saved the run. (2) Ghost saves:
+    // ghosted and about to wrap through a wall or slide over an obstacle or
+    // the body. A short cooldown keeps corners from double-firing.
+    const tNow = performance.now();
+    const hazardAt = (x: number, y: number) =>
+      x < 0 ||
+      y < 0 ||
+      x >= GRID ||
+      y >= GRID ||
+      obstacles.current.some((o) => o.x === x && o.y === y) ||
+      s.some((p, i) => i < s.length - 1 && p.x === x && p.y === y);
+    if (dir.current !== prevDir) {
+      const oldV = DIR_V[prevDir];
+      if (hazardAt(s[0].x + oldV.x, s[0].y + oldV.y) && tNow > lastNearMiss.current) {
+        lastNearMiss.current = tNow + 900;
+        registerNearMiss(tNow);
+      }
+    } else if (ghost && tNow > lastNearMiss.current) {
+      const gv = DIR_V[dir.current];
+      const intoWall = s[0].x + gv.x < 0 || s[0].x + gv.x >= GRID || s[0].y + gv.y < 0 || s[0].y + gv.y >= GRID;
+      const intoObstacle = obstacles.current.some((o) => o.x === s[0].x + gv.x && o.y === s[0].y + gv.y);
+      const intoSelf = s.some((p, i) => i < s.length - 1 && p.x === s[0].x + gv.x && p.y === s[0].y + gv.y);
+      if (intoWall || intoObstacle || intoSelf) {
+        lastNearMiss.current = tNow + 900;
+        registerNearMiss(tNow);
+      }
+    }
+
     const out = hx < 0 || hy < 0 || hx >= GRID || hy >= GRID;
 
     if (out && !ghost) {
@@ -925,7 +1048,7 @@ export default function SnakeGame() {
       timers.current.nextPowerAt = performance.now() + POWERUP_INTERVAL;
       applyPower(type);
     }
-  }, [addScore, advanceLevel, applyPower, burst, die, spawnFood, unlock, winGame]);
+  }, [addScore, advanceLevel, applyPower, burst, die, registerNearMiss, spawnFood, unlock, winGame]);
 
   /* ---------- frame render ---------- */
 
@@ -1021,6 +1144,16 @@ export default function SnakeGame() {
       ctx.strokeRect(2, 2, CANVAS - 4, CANVAS - 4);
     }
 
+    // near-miss flash: quick white edge glow, fading over ~380ms
+    if (now < nearMissUntil.current) {
+      const t = (nearMissUntil.current - now) / 380; // 1 → 0
+      ctx.globalAlpha = Math.max(0, t) * 0.5;
+      ctx.lineWidth = 4 + 8 * t;
+      ctx.strokeStyle = "rgba(255,255,255,0.9)";
+      ctx.strokeRect(2, 2, CANVAS - 4, CANVAS - 4);
+      ctx.globalAlpha = 1;
+    }
+
     // head — always solid
     ctx.fillStyle = skin.head;
     roundRect(ctx, s[0].x * CELL + 1, s[0].y * CELL + 1, CELL - 2, CELL - 2, 5);
@@ -1108,6 +1241,12 @@ export default function SnakeGame() {
           lastSlowShown.current = sLeft;
           setSlowSecs(sLeft);
         }
+
+        // near-miss edge glow decay — clear state once the window passes
+        if (nearMissUntil.current > 0 && now >= nearMissUntil.current) {
+          nearMissUntil.current = 0;
+          setNearMiss(false);
+        }
       }
 
       renderRef.current();
@@ -1165,9 +1304,11 @@ export default function SnakeGame() {
       else if (k === " ") togglePause();
       else if (k === "m" || k === "M") toggleMuted();
       else if (k === "Escape") {
-        if (showHelp) setShowHelp(false);
+        if (showBoard) setShowBoard(false);
+        else if (showHelp) setShowHelp(false);
         else if (showSkins) setShowSkins(false);
         else if (showAch) setShowAch(false);
+        else if (confirmClear) setConfirmClear(false);
         else if (phaseRef.current === "playing") setPhase("paused");
       } else if (k === "Enter" || k === "r" || k === "R") {
         if (phaseRef.current !== "dying") beginGame();
@@ -1175,7 +1316,7 @@ export default function SnakeGame() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [beginGame, queueDir, setPhase, showAch, showHelp, showSkins, toggleMuted, togglePause]);
+  }, [beginGame, queueDir, setPhase, showAch, showBoard, showHelp, showSkins, toggleMuted, togglePause]);
 
   /* ---------- auto-pause when the tab is hidden ---------- */
 
@@ -1253,6 +1394,9 @@ export default function SnakeGame() {
             <IconButton label="Achievements" onClick={() => setShowAch(true)}>
               <Trophy className="h-4 w-4" />
             </IconButton>
+            <IconButton label="Leaderboard" onClick={() => setShowBoard(true)}>
+              <Medal className="h-4 w-4" />
+            </IconButton>
             <IconButton label={muted ? "Unmute" : "Mute"} onClick={toggleMuted}>
               {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
             </IconButton>
@@ -1279,7 +1423,7 @@ export default function SnakeGame() {
         <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center justify-between gap-2 px-4 py-3">
           <div className="flex flex-wrap items-center gap-2">
             <Pill label="Score" value={score.toLocaleString()} />
-            <Pill label="High" value={high.toLocaleString()} />
+            <Pill label="Best" value={high.toLocaleString()} />
             <Pill label="Level" value={`${level}/${MAX_LEVEL}`} />
             <Pill label="Lives" value={"●".repeat(lives) || "—"} />
           </div>
@@ -1392,6 +1536,9 @@ export default function SnakeGame() {
                   </p>
                   <div className="mt-6 space-y-2">
                     <OverlayButton onClick={beginGame}>Start game</OverlayButton>
+                    <OverlayButton variant="ghost" onClick={() => setShowBoard(true)}>
+                      Leaderboard
+                    </OverlayButton>
                     <OverlayButton variant="ghost" onClick={() => setShowSkins(true)}>
                       Snake colors
                     </OverlayButton>

@@ -188,7 +188,7 @@ export default function Landing() {
       <footer className="border-t border-border">
         <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-2 px-6 py-6 text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
           <span>Neon Snake</span>
-          <span>Built for the browser · scores live on your device</span>
+          <span>Built for the browser · your top 5 runs live on this device</span>
         </div>
       </footer>
     </div>

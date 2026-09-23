@@ -96,8 +96,9 @@ export default function Landing() {
                 Neon Snake
               </h1>
               <p className="mt-6 max-w-md text-base leading-relaxed text-muted-foreground">
-                A minimalist snake game in six levels of rising speed. Eat the discs,
-                bank the power-ups, and keep three lives intact.
+                A minimalist snake game across fifteen levels and five color
+                zones. Eat the discs, dodge the obstacles, bank the power-ups,
+                and keep three lives intact.
               </p>
               <div className="mt-9 flex flex-wrap items-center gap-3">
                 <Link
@@ -124,8 +125,8 @@ export default function Landing() {
         <section className="border-b border-border">
           <div className="mx-auto grid w-full max-w-5xl grid-cols-2 gap-px bg-border px-0 md:grid-cols-4">
             {[
-              ["Levels", "6"],
-              ["Lives", "3"],
+              ["Levels", "15"],
+              ["Zones", "5"],
               ["Speed", "Rising"],
               ["Controls", "Keys + touch"],
             ].map(([k, v]) => (
@@ -146,6 +147,11 @@ export default function Landing() {
             <h2 className="mt-4 max-w-md text-2xl font-semibold tracking-tight">
               Four marks. One spawns every nine seconds.
             </h2>
+            <p className="mt-4 max-w-md text-sm leading-relaxed text-muted-foreground">
+              The board recolors every three levels — Graphite, Signal Green, Cyan
+              Circuit, Magenta Drive, Amber Core — and unlocks your next snake color
+              as you go.
+            </p>
             <div className="mt-12 grid gap-px bg-border sm:grid-cols-2 lg:grid-cols-4">
               {POWERS.map((p) => (
                 <div key={p.name} className="bg-background px-6 py-8">
@@ -164,7 +170,7 @@ export default function Landing() {
         <section>
           <div className="mx-auto flex w-full max-w-5xl flex-col items-center px-6 py-24 text-center">
             <h2 className="max-w-lg text-3xl font-semibold tracking-tight">
-              Clear all six levels. Keep the tail out of the walls.
+              Clear all fifteen levels. Keep the tail out of the walls.
             </h2>
             <Link
               to="/play"

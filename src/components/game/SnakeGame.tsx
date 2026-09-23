@@ -37,6 +37,8 @@ import {
   ACHIEVEMENTS,
   CANVAS,
   CELL,
+  COMBO_WINDOW_MS,
+  comboMultiplier,
   DIR_V,
   FOODS_PER_LEVEL,
   GHOST_MS,
@@ -51,6 +53,9 @@ import {
   POWERUP_LIFETIME,
   POWER_LETTER,
   RESPAWN_MS,
+  RISK_DISC_CHANCE,
+  RISK_FOOD_COLOR,
+  RISK_POINTS,
   SKINS,
   SLOW_MS,
   SPEED_LABELS,
@@ -137,6 +142,57 @@ function roundRect(
 }
 
 /* ------------------------------------------------------------------ */
+/*  Risk/reward disc placement                                         */
+/* ------------------------------------------------------------------ */
+
+const NEIGHBORS: Array<[number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+
+/**
+ * Find a meaningfully risky free cell for a risk/reward disc: adjacent to an
+ * obstacle, hugging a wall, or in a tight gap. Levels without obstacles fall
+ * back to any free cell on the outer edge. Returns null when no risky spot
+ * exists — the caller then spawns a normal disc instead.
+ */
+function pickRiskyCell(obstacles: Pt[], isFree: (x: number, y: number) => boolean): Pt | null {
+  if (obstacles.length === 0) {
+    const edge: Pt[] = [];
+    for (let i = 0; i < GRID; i++) {
+      const cands: Array<[number, number]> = [[i, 0], [i, GRID - 1], [0, i], [GRID - 1, i]];
+      for (const [x, y] of cands) if (isFree(x, y)) edge.push({ x, y });
+    }
+    return edge.length > 0 ? edge[Math.floor(Math.random() * edge.length)] : null;
+  }
+
+  // score sampled free cells: wall proximity + obstacle adjacency + tight gaps
+  let best: Pt | null = null;
+  let bestScore = 0;
+  for (let i = 0; i < 90; i++) {
+    const x = randCell();
+    const y = randCell();
+    if (!isFree(x, y)) continue;
+    const edge = Math.min(x, y, GRID - 1 - x, GRID - 1 - y);
+    let score = edge === 0 ? 2 : edge === 1 ? 1 : 0;
+    let freeN = 0;
+    let obsN = 0;
+    for (const [dx, dy] of NEIGHBORS) {
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= GRID || ny >= GRID) continue;
+      if (obstacles.some((o) => o.x === nx && o.y === ny)) obsN += 1;
+      else freeN += 1;
+    }
+    score += obsN * 2;
+    if (freeN <= 2) score += 1; // hemmed in on two sides
+    if (score >= 1 && score > bestScore) {
+      bestScore = score;
+      best = { x, y };
+      if (bestScore >= 4) break; // risky enough — stop sampling
+    }
+  }
+  return best;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Procedural sound effects (WebAudio, no files)                      */
 /* ------------------------------------------------------------------ */
 
@@ -180,6 +236,12 @@ class Sfx {
   eat() {
     this.beep(620, 0.07, "square", 0.08);
     this.beep(930, 0.09, "square", 0.07, 0.05);
+  }
+  riskEat() {
+    // distinct high-value arpeggio for risk/reward discs
+    this.beep(740, 0.07, "square", 0.09);
+    this.beep(1108, 0.07, "square", 0.09, 0.06);
+    this.beep(1480, 0.14, "triangle", 0.1, 0.12);
   }
   power() {
     this.beep(523, 0.08, "triangle", 0.1);
@@ -353,6 +415,10 @@ export default function SnakeGame() {
   const livesRef = useRef(START_LIVES);
   const levelRef = useRef(1);
   const eatenRef = useRef(0);
+  const comboRef = useRef(0); // consecutive in-window disc eats
+  const comboExpireRef = useRef(0); // wall-clock ms timestamp of window end
+  const comboPulse = useRef(0); // increments to retrigger the HUD pulse
+  const isRiskDisc = useRef(false); // current food is a risk/reward disc
   const phaseRef = useRef<Phase>("start");
   const fxRef = useRef(false); // true → reduced motion
   const swipe = useRef<{ x: number; y: number } | null>(null);
@@ -379,6 +445,7 @@ export default function SnakeGame() {
   const [unlocked, setUnlocked] = useState<string[]>(() => [...achRef.current]);
   const [ghostSecs, setGhostSecs] = useState(0);
   const [slowSecs, setSlowSecs] = useState(0);
+  const [combo, setCombo] = useState<{ n: number; mult: number; pulse: number } | null>(null);
   const [showHelp, setShowHelp] = useState(false);
   const [showSkins, setShowSkins] = useState(false);
   const [showAch, setShowAch] = useState(false);
@@ -547,13 +614,27 @@ export default function SnakeGame() {
     const taken = new Set(snake.current.map((p) => `${p.x},${p.y}`));
     for (const o of obstacles.current) taken.add(`${o.x},${o.y}`);
     if (power.current) taken.add(`${power.current.cell.x},${power.current.cell.y}`);
-    let x = 0;
-    let y = 0;
-    do {
-      x = randCell();
-      y = randCell();
-    } while (taken.has(`${x},${y}`));
-    food.current = { x, y };
+    const isFree = (x: number, y: number) => !taken.has(`${x},${y}`);
+    const randomFree = (): Pt => {
+      let x = 0;
+      let y = 0;
+      do {
+        x = randCell();
+        y = randCell();
+      } while (!isFree(x, y));
+      return { x, y };
+    };
+
+    // ~1 in 4–5 spawns is a risk/reward disc placed somewhere dangerous;
+    // downgrade to a normal disc when no risky spot is available
+    let cell: Pt | null = null;
+    let risk = Math.random() < RISK_DISC_CHANCE;
+    if (risk) {
+      cell = pickRiskyCell(obstacles.current, isFree);
+      risk = cell !== null;
+    }
+    food.current = cell ?? randomFree();
+    isRiskDisc.current = risk;
   }, []);
 
   const spawnPower = useCallback(() => {
@@ -657,6 +738,9 @@ export default function SnakeGame() {
     setZoneIdx(0);
     setGhostSecs(0);
     setSlowSecs(0);
+    comboRef.current = 0;
+    comboExpireRef.current = 0;
+    setCombo(null);
     bakeStatic();
     spawnFood();
   }, [bakeStatic, spawnFood]);
@@ -693,6 +777,9 @@ export default function SnakeGame() {
     sfx.current?.die();
     diedThisLevel.current = true;
     flawlessStreak.current = 0;
+    // dying always breaks the combo
+    comboRef.current = 0;
+    setCombo(null);
     const head = snake.current[0];
     burst((head.x + 0.5) * CELL, (head.y + 0.5) * CELL, 20);
     if (!fxRef.current) shake.current = 10;
@@ -710,6 +797,8 @@ export default function SnakeGame() {
 
   const winGame = useCallback(() => {
     setPhase("won");
+    comboRef.current = 0;
+    setCombo(null);
     unlock("champion");
     sfx.current?.win();
   }, [setPhase, unlock]);
@@ -802,11 +891,18 @@ export default function SnakeGame() {
 
     s.unshift({ x: hx, y: hy });
 
-    // food
+    // food — the combo window is wall-clock based; ghost/slow never pause it
     if (hx === food.current.x && hy === food.current.y) {
-      addScore(POINTS_FOOD);
+      const nowMs = performance.now();
+      comboRef.current = nowMs <= comboExpireRef.current ? comboRef.current + 1 : 1;
+      comboExpireRef.current = nowMs + COMBO_WINDOW_MS;
+      const mult = comboMultiplier(comboRef.current);
+      comboPulse.current += 1;
+      setCombo({ n: comboRef.current, mult, pulse: comboPulse.current });
+      addScore((isRiskDisc.current ? RISK_POINTS : POINTS_FOOD) * mult);
       eatenRef.current += 1;
-      sfx.current?.eat();
+      if (isRiskDisc.current) sfx.current?.riskEat();
+      else sfx.current?.eat();
       burst((hx + 0.5) * CELL, (hy + 0.5) * CELL, 8);
       unlock("first-meal");
       if (eatenRef.current >= FOODS_PER_LEVEL) {
@@ -856,18 +952,32 @@ export default function SnakeGame() {
     // prebaked static layer: background, dot grid, obstacles
     ctx.drawImage(stat, 0, 0, CANVAS, CANVAS);
 
-    // food — pulsing disc in the zone color
-    const pulse = 0.85 + 0.15 * Math.sin(now / 180);
-    ctx.fillStyle = z.food;
-    ctx.beginPath();
-    ctx.arc(
-      (food.current.x + 0.5) * CELL,
-      (food.current.y + 0.5) * CELL,
-      CELL * 0.26 * pulse,
-      0,
-      Math.PI * 2,
-    );
-    ctx.fill();
+    // food — pulsing disc in the zone color; risk discs glow rose, faster
+    const fx = (food.current.x + 0.5) * CELL;
+    const fy = (food.current.y + 0.5) * CELL;
+    if (isRiskDisc.current) {
+      const pulse = 0.9 + 0.18 * Math.sin(now / 90);
+      ctx.fillStyle = RISK_FOOD_COLOR;
+      ctx.globalAlpha = 0.22 + 0.14 * Math.sin(now / 90);
+      ctx.beginPath();
+      ctx.arc(fx, fy, CELL * 0.52 * pulse, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      ctx.arc(fx, fy, CELL * 0.3 * pulse, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = RISK_FOOD_COLOR;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(fx, fy, CELL * 0.44, 0, Math.PI * 2);
+      ctx.stroke();
+    } else {
+      const pulse = 0.85 + 0.15 * Math.sin(now / 180);
+      ctx.fillStyle = z.food;
+      ctx.beginPath();
+      ctx.arc(fx, fy, CELL * 0.26 * pulse, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
     // power-up — lettered disc in the zone accent, blinks before expiring
     if (power.current) {
@@ -959,6 +1069,12 @@ export default function SnakeGame() {
 
       if (phaseRef.current === "playing") {
         const now = performance.now();
+
+        // combo expiry — wall-clock only; ghost/slow never pause or extend it
+        if (comboRef.current > 0 && now > comboExpireRef.current) {
+          comboRef.current = 0;
+          setCombo(null);
+        }
 
         // schedule / expire power-ups
         if (!power.current && now >= timers.current.nextPowerAt) {
@@ -1167,6 +1283,29 @@ export default function SnakeGame() {
             <Pill label="Lives" value={"●".repeat(lives) || "—"} />
           </div>
           <div className="flex items-center gap-2">
+            <AnimatePresence>
+              {combo && (
+                <motion.span
+                  key="combo"
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.18 }}
+                  className="border border-border bg-card/50 px-3 py-1.5 font-mono text-xs tabular-nums text-muted-foreground"
+                >
+                  <motion.span
+                    key={combo.pulse}
+                    initial={{ scale: 1.4 }}
+                    animate={{ scale: 1 }}
+                    transition={{ duration: 0.22, ease: "easeOut" }}
+                    className="inline-block text-foreground"
+                  >
+                    {combo.n} COMBO
+                  </motion.span>
+                  {combo.mult > 1 && <span style={{ color: zone.accent }}> ×{combo.mult}</span>}
+                </motion.span>
+              )}
+            </AnimatePresence>
             {ghostSecs > 0 && (
               <span className="border border-border bg-card/50 px-3 py-1.5 font-mono text-xs tabular-nums text-muted-foreground">
                 GHOST {ghostSecs}s
@@ -1363,6 +1502,14 @@ export default function SnakeGame() {
                       <span className="font-mono text-foreground">G</span> ghost (wrap through
                       everything),{" "}
                       <span className="font-mono text-foreground">−</span> shrink your tail.
+                    </li>
+                    <li>
+                      <span className="text-foreground">Combo</span> — eat again within 2.5s to
+                      chain: ×2 at 3, ×3 at 6, ×4 at 10 consecutive discs.
+                    </li>
+                    <li>
+                      <span className="text-foreground">Risk discs</span> — glowing rose discs
+                      near obstacles and walls pay 5× points.
                     </li>
                     <li>
                       <span className="text-foreground">Colors</span> — snake skins unlock as you

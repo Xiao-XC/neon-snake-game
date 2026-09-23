@@ -37,6 +37,28 @@ export const SLOW_MS = 6000; // slow-motion duration
 export const RESPAWN_MS = 900; // death pause before respawn / game over
 export const MAX_PARTICLES = 80; // hard cap for the particle system
 
+/* ------------------------------------------------------------------ */
+/*  Combo + risk/reward discs                                          */
+/* ------------------------------------------------------------------ */
+
+/** ms after an eat during which the next eat extends the combo. */
+export const COMBO_WINDOW_MS = 2500;
+
+/** Score multiplier for a combo count: 0–2 → ×1, 3–5 → ×2, 6–9 → ×3, 10+ → ×4. */
+export function comboMultiplier(combo: number): number {
+  if (combo >= 10) return 4;
+  if (combo >= 6) return 3;
+  if (combo >= 3) return 2;
+  return 1;
+}
+
+/** ~1 in 4–5 disc spawns is a risk/reward disc. */
+export const RISK_DISC_CHANCE = 0.22;
+/** Risk/reward discs pay 5× a normal disc before the combo multiplier. */
+export const RISK_POINTS = POINTS_FOOD * 5;
+/** Distinct rose color for risk/reward discs (stands out on every zone). */
+export const RISK_FOOD_COLOR = "#fb7185";
+
 export type Pt = { x: number; y: number };
 export type Dir = "up" | "down" | "left" | "right";
 export type Phase = "start" | "playing" | "paused" | "dying" | "over" | "won";

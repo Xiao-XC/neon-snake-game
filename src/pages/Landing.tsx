@@ -150,7 +150,8 @@ export default function Landing() {
             <p className="mt-4 max-w-md text-sm leading-relaxed text-muted-foreground">
               The board recolors every three levels — Graphite, Signal Green, Cyan
               Circuit, Magenta Drive, Amber Core — and unlocks your next snake color
-              as you go.
+              as you go. Chain eats for a combo multiplier, and chase the glowing
+              risk discs near the walls for five-fold points.
             </p>
             <div className="mt-12 grid gap-px bg-border sm:grid-cols-2 lg:grid-cols-4">
               {POWERS.map((p) => (
